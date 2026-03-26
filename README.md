@@ -30,6 +30,11 @@ The goal is not just to make melee attacks "work" — it's to structure the syst
 - Keep combat feedback modular so it can be reused across multiple enemies
  
 ---
+
+<div align="center">
+  <img src="Gifs/CombatSystem.gif" width="80%">
+  <p><em>Tooltip generation driven from item data and Gameplay Effect modifier definitions.</em></p>
+</div>
  
 ## What This System Covers
  
