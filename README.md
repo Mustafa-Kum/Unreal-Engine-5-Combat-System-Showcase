@@ -34,7 +34,10 @@ The goal is not just to make melee attacks "work" — it's to structure the syst
 <div align="center">
   <img src="Gifs/CombatSystem.gif" width="100%">
   <p><em>Tooltip generation driven from item data and Gameplay Effect modifier definitions.</em></p>
+  <img src="Images/Image-1.png" width="100%">
+  <p><em>Data-driven weapon combat configuration defining combo montage flow, hit stop behavior, and camera shake feedback.</em></p>
 </div>
+
  
 ## What This System Covers
  
