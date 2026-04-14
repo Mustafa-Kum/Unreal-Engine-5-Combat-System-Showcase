@@ -1,22 +1,40 @@
 #include "Components/CombatComponent.h"
-#include "Characters/CharacterBase.h"
-#include "Abilities/AttributeSets/CharacterAttributeSet.h"
-#include "AbilitySystemComponent.h"
-#include "Components/InventoryComponent.h"
-#include "Components/PrimitiveComponent.h"
+
 #include "Animation/AnimInstance.h"
 #include "Animation/AnimMontage.h"
-#include "GameFramework/PlayerController.h"
+#include "AbilitySystemComponent.h"
+#include "Abilities/BaseGameplayAbility.h"
+#include "Characters/CharacterBase.h"
+#include "Characters/HeroLocomotionComponent.h"
+#include "CombatTypes.h"
+#include "Components/CombatImpactComponent.h"
+#include "Components/EquipmentComponent.h"
+#include "Components/WeaponActionComponent.h"
+#include "DataAssets/WeaponDataAsset.h"
 #include "Engine/AssetManager.h"
 #include "Engine/StreamableManager.h"
+#include "WoWCloneGameplayTags.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogCombatSystem, Log, All);
 
+bool UCombatComponent::FAbilityCastRuntimeState::IsActive() const
+{
+	return SourceAbility.IsValid() && Config.IsValid();
+}
+
+void UCombatComponent::FAbilityCastRuntimeState::Reset()
+{
+	Config = FAbilityCastConfig();
+	SourceAbility.Reset();
+	AbilityName = FText::GetEmpty();
+	StartWorldTime = 0.0f;
+	bHasCommitted = false;
+}
+
 UCombatComponent::UCombatComponent()
 {
-	PrimaryComponentTick.bCanEverTick = true;
+	PrimaryComponentTick.bCanEverTick = false;
 	PrimaryComponentTick.bStartWithTickEnabled = false;
-	bWantsInitializeComponent = false;
 }
 
 void UCombatComponent::BeginPlay()
@@ -24,36 +42,86 @@ void UCombatComponent::BeginPlay()
 	Super::BeginPlay();
 	OwnerCharacter = Cast<ACharacterBase>(GetOwner());
 
-	if (UPrimitiveComponent* HitCollisionComp = OwnerCharacter ? OwnerCharacter->GetMeleeHitCollisionComponent() : nullptr)
+	if (!OwnerCharacter)
 	{
-		HitCollisionComp->OnComponentBeginOverlap.AddDynamic(this, &UCombatComponent::HandleWeaponHitOverlap);
+		UE_LOG(LogCombatSystem, Error, TEXT("CombatComponent must be attached to CharacterBase."));
+		return;
 	}
+
+	if (!GetEquipmentComponent() || !GetCombatImpactComponent() || !GetWeaponActionComponent())
+	{
+		UE_LOG(LogCombatSystem, Error, TEXT("CombatComponent is missing required sibling components on %s."), *GetNameSafe(OwnerCharacter));
+	}
+
+	InitializeCombatState();
 }
 
 void UCombatComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	if (UPrimitiveComponent* HitCollisionComp = OwnerCharacter ? OwnerCharacter->GetMeleeHitCollisionComponent() : nullptr)
+	if (UWorld* World = GetWorld())
 	{
-		HitCollisionComp->OnComponentBeginOverlap.RemoveDynamic(this, &UCombatComponent::HandleWeaponHitOverlap);
+		World->GetTimerManager().ClearTimer(PendingComboRetryTimerHandle);
+		World->GetTimerManager().ClearTimer(CombatExitTimerHandle);
 	}
 
-	RestoreActiveHitStop();
-	HitActorsInActiveMeleeWindow.Reset();
+	ClearAbilityCastState(false);
+
+	if (UCombatImpactComponent* CombatImpactComp = GetCombatImpactComponent())
+	{
+		CombatImpactComp->ClearCurrentAttackMontage(CurrentAttackMontage.Get());
+	}
+
+	ActiveComboWindows.Reset();
+	RefreshComboWindowState();
 	ClearBufferedAttackInput();
-	ResetReliableMeleeTraceState();
+	CachedWeaponAction.Reset();
+	CachedCombatImpact.Reset();
+	CachedEquipment.Reset();
+	CachedHeroLocomotion.Reset();
+	CachedAnimInstance.Reset();
 	Super::EndPlay(EndPlayReason);
 }
 
-void UCombatComponent::ProcessAttack()
+void UCombatComponent::InitializeCombatState()
+{
+	bIsInCombat = false;
+	ClearAbilityCastState(false);
+
+	if (UAbilitySystemComponent* AbilitySystemComponent = OwnerCharacter ? OwnerCharacter->GetAbilitySystemComponent() : nullptr)
+	{
+		HandleCombatTagChange(AbilitySystemComponent, false);
+	}
+
+	RevertCombatStateMovementOverrides();
+}
+
+void UCombatComponent::NotifyDamageDealt()
+{
+	UAbilitySystemComponent* AbilitySystemComponent = OwnerCharacter ? OwnerCharacter->GetAbilitySystemComponent() : nullptr;
+	if (!AbilitySystemComponent)
+	{
+		return;
+	}
+
+	if (!bIsInCombat)
+	{
+		bIsInCombat = true;
+		EnterCombatState(AbilitySystemComponent);
+	}
+
+	RefreshCombatExitTimer();
+}
+
+void UCombatComponent::ProcessAttackInput(ECombatAttackType AttackType)
 {
 	if (!CanPerformAttack())
 	{
 		return;
 	}
 
-	if (bCanAdvanceCombo)
+	if (CanAdvanceComboForAttackType(AttackType))
 	{
-		HandleComboInput();
+		HandleComboInput(AttackType);
 		return;
 	}
 
@@ -61,98 +129,81 @@ void UCombatComponent::ProcessAttack()
 	{
 		if (const UAnimMontage* AttackMontage = CurrentAttackMontage.Get(); AttackMontage && AnimInstance->Montage_IsPlaying(AttackMontage))
 		{
-			BufferAttackInput();
+			BufferAttackInput(AttackType);
 			return;
 		}
 	}
 
-	HandleInitialInput();
+	HandleInitialInput(AttackType);
 }
 
-void UCombatComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
+void UCombatComponent::BeginComboWindow(const UAnimNotifyState* WindowSource, const FComboWindowRequest& ComboWindowRequest)
 {
-	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
-
-	if (!bEnableReliableMeleeTracing || ActiveMeleeHitWindows.IsEmpty())
+	if (!WindowSource)
 	{
 		return;
 	}
 
-	TraceReliableMeleeHits();
+	FComboWindowRuntimeState& WindowState = ActiveComboWindows.FindOrAdd(WindowSource);
+	WindowState.Request = ComboWindowRequest;
+	++WindowState.ActiveCount;
+	RefreshComboWindowState();
+	ConsumeBufferedAttackInput();
 }
 
-void UCombatComponent::SetCanAdvanceCombo(bool bInCanAdvance)
+void UCombatComponent::EndComboWindow(const UAnimNotifyState* WindowSource)
 {
-	bCanAdvanceCombo = bInCanAdvance;
-
-	if (bCanAdvanceCombo)
+	if (!WindowSource)
 	{
-		ConsumeBufferedAttackInput();
+		return;
 	}
+
+	if (FComboWindowRuntimeState* WindowState = ActiveComboWindows.Find(WindowSource))
+	{
+		WindowState->ActiveCount = FMath::Max(0, WindowState->ActiveCount - 1);
+		if (WindowState->ActiveCount == 0)
+		{
+			ActiveComboWindows.Remove(WindowSource);
+		}
+	}
+
+	RefreshComboWindowState();
 }
 
 void UCombatComponent::BeginAttackMoveInterruptWindow(const UAnimNotifyState* WindowSource, const UAnimMontage* AttackMontage, float InBlendOutTime)
 {
-	if (!WindowSource || !AttackMontage)
-	{
-		return;
-	}
-
-	FAttackInterruptWindowState& WindowState = ActiveAttackInterruptWindows.FindOrAdd(WindowSource);
-	WindowState.Montage = AttackMontage;
-	WindowState.BlendOutTime = FMath::Max(0.0f, InBlendOutTime);
-	++WindowState.ActiveCount;
+	BeginInterruptWindow(ActiveAttackInterruptWindows, WindowSource, AttackMontage, InBlendOutTime);
 }
 
 void UCombatComponent::EndAttackMoveInterruptWindow(const UAnimNotifyState* WindowSource)
 {
-	if (!WindowSource)
-	{
-		return;
-	}
-
-	if (FAttackInterruptWindowState* WindowState = ActiveAttackInterruptWindows.Find(WindowSource))
-	{
-		WindowState->ActiveCount = FMath::Max(0, WindowState->ActiveCount - 1);
-		if (WindowState->ActiveCount == 0)
-		{
-			ActiveAttackInterruptWindows.Remove(WindowSource);
-		}
-	}
+	EndInterruptWindow(ActiveAttackInterruptWindows, WindowSource);
 }
 
-void UCombatComponent::BeginMeleeHitWindow(const UAnimNotifyState* WindowSource, const UAnimMontage* AttackMontage)
+void UCombatComponent::BeginAbilityInterruptWindow(const UAnimNotifyState* WindowSource, const UAnimMontage* AttackMontage, float InBlendOutTime)
 {
-	if (!WindowSource || !AttackMontage)
+	BeginInterruptWindow(ActiveAbilityInterruptWindows, WindowSource, AttackMontage, InBlendOutTime);
+}
+
+void UCombatComponent::EndAbilityInterruptWindow(const UAnimNotifyState* WindowSource)
+{
+	EndInterruptWindow(ActiveAbilityInterruptWindows, WindowSource);
+}
+
+void UCombatComponent::BeginMeleeHitWindow(const UAnimNotifyState* WindowSource, const UAnimMontage* AttackMontage, const FMeleeHitWindowRequest& HitWindowRequest)
+{
+	if (UCombatImpactComponent* CombatImpactComp = GetCombatImpactComponent())
 	{
-		return;
+		CombatImpactComp->BeginMeleeHitWindow(WindowSource, AttackMontage, HitWindowRequest);
 	}
-
-	FMeleeHitWindowState& WindowState = ActiveMeleeHitWindows.FindOrAdd(WindowSource);
-	WindowState.Montage = AttackMontage;
-	++WindowState.ActiveCount;
-
-	ResetReliableMeleeTraceState();
-	RefreshWeaponHitCollisionState();
 }
 
 void UCombatComponent::EndMeleeHitWindow(const UAnimNotifyState* WindowSource)
 {
-	if (!WindowSource)
+	if (UCombatImpactComponent* CombatImpactComp = GetCombatImpactComponent())
 	{
-		return;
+		CombatImpactComp->EndMeleeHitWindow(WindowSource);
 	}
-
-	if (FMeleeHitWindowState* WindowState = ActiveMeleeHitWindows.Find(WindowSource))
-	{
-		WindowState->ActiveCount = FMath::Max(0, WindowState->ActiveCount - 1);
-		if (WindowState->ActiveCount == 0)
-		{
-			ActiveMeleeHitWindows.Remove(WindowSource);
-		}
-	}
-
-	RefreshWeaponHitCollisionState();
 }
 
 bool UCombatComponent::TryInterruptAttackForMovement()
@@ -163,150 +214,487 @@ bool UCombatComponent::TryInterruptAttackForMovement()
 		return false;
 	}
 
-	const UAnimMontage* AttackMontage = ResolveInterruptibleAttackMontage(AnimInstance);
+	const UAnimMontage* AttackMontage = ResolveInterruptibleMontage(AnimInstance, ActiveAttackInterruptWindows);
 	if (!AttackMontage)
 	{
 		return false;
 	}
 
 	UE_LOG(LogCombatSystem, Log, TEXT("Attack montage interrupted by movement input."));
+	InterruptAttackMontage(AnimInstance, AttackMontage, ResolveInterruptBlendOutTime(AttackMontage, ActiveAttackInterruptWindows));
+	return true;
+}
 
-	AnimInstance->Montage_Stop(ResolveInterruptBlendOutTime(AttackMontage), AttackMontage);
-	ClearAttackInterruptWindowsForMontage(AttackMontage);
-	ClearMeleeHitWindowsForMontage(AttackMontage);
-	CurrentAttackMontage.Reset();
-	ResetCombo();
-	ClearBufferedAttackInput();
+bool UCombatComponent::TryBeginAbilityAreaImpact(const FAbilityAreaImpactConfig& AreaImpactConfig, UGameplayAbility* SourceAbility)
+{
+	if (!CanActivateAbilityAreaImpact(AreaImpactConfig) || !IsValid(SourceAbility))
+	{
+		return false;
+	}
+
+	UCombatImpactComponent* CombatImpactComp = GetCombatImpactComponent();
+	if (!CombatImpactComp)
+	{
+		return false;
+	}
+
+	UAnimInstance* AnimInstance = GetAnimInstance();
+	if (!TryPrepareAbilityAreaImpactActivation(AnimInstance))
+	{
+		return false;
+	}
+
+	CombatImpactComp->BeginAbilityAreaImpact(AreaImpactConfig, SourceAbility);
+	return true;
+}
+
+bool UCombatComponent::CanActivateAbilityAreaImpact(const FAbilityAreaImpactConfig& AreaImpactConfig, FGameplayTagContainer* OptionalRelevantTags) const
+{
+	if (!OwnerCharacter || !AreaImpactConfig.IsValid())
+	{
+		if (OptionalRelevantTags)
+		{
+			OptionalRelevantTags->AddTag(WoWCloneTags::AbilityFail_Blocked);
+		}
+
+		return false;
+	}
+
+	if (HasInterruptibleAbilityCast())
+	{
+		if (OptionalRelevantTags)
+		{
+			OptionalRelevantTags->AddTag(WoWCloneTags::AbilityFail_Blocked);
+		}
+
+		return false;
+	}
+
+	const UCombatImpactComponent* CombatImpactComp = GetCombatImpactComponent();
+	if (!CombatImpactComp || CombatImpactComp->HasActiveAbilityAreaImpact())
+	{
+		if (OptionalRelevantTags)
+		{
+			OptionalRelevantTags->AddTag(WoWCloneTags::AbilityFail_Blocked);
+		}
+
+		return false;
+	}
+
+	const UWeaponActionComponent* WeaponActionComp = GetWeaponActionComponent();
+	if (WeaponActionComp && WeaponActionComp->IsWeaponActionInProgress())
+	{
+		return false;
+	}
+
+	UAnimInstance* AnimInstance = GetAnimInstance();
+	if (!AnimInstance)
+	{
+		if (OptionalRelevantTags)
+		{
+			OptionalRelevantTags->AddTag(WoWCloneTags::AbilityFail_Blocked);
+		}
+
+		return false;
+	}
+
+	if (!AnimInstance->IsAnyMontagePlaying())
+	{
+		return true;
+	}
+
+	if (!ResolveInterruptibleMontage(AnimInstance, ActiveAbilityInterruptWindows))
+	{
+		return false;
+	}
 
 	return true;
 }
 
-void UCombatComponent::HandleWeaponHitOverlap(
-	UPrimitiveComponent* OverlappedComponent,
-	AActor* OtherActor,
-	UPrimitiveComponent* OtherComp,
-	int32 OtherBodyIndex,
-	bool bFromSweep,
-	const FHitResult& SweepResult)
+void UCombatComponent::EndAbilityAreaImpact(UGameplayAbility* SourceAbility)
 {
-	if (!CanRegisterMeleeHit(OtherActor))
+	if (UCombatImpactComponent* CombatImpactComp = GetCombatImpactComponent())
+	{
+		CombatImpactComp->EndAbilityAreaImpact(SourceAbility);
+	}
+}
+
+void UCombatComponent::TriggerAbilityAreaImpact(const UAnimMontage* SourceMontage)
+{
+	if (UCombatImpactComponent* CombatImpactComp = GetCombatImpactComponent())
+	{
+		CombatImpactComp->TriggerAbilityAreaImpact(SourceMontage);
+	}
+}
+
+bool UCombatComponent::TryBeginAbilityCast(const FAbilityCastConfig& CastConfig, UGameplayAbility* SourceAbility, FGameplayTagContainer* OptionalRelevantTags)
+{
+	if (!OwnerCharacter || !IsValid(SourceAbility) || !CastConfig.IsValid())
+	{
+		if (OptionalRelevantTags)
+		{
+			OptionalRelevantTags->AddTag(WoWCloneTags::AbilityFail_Blocked);
+		}
+
+		return false;
+	}
+
+	if (HasInterruptibleAbilityCast())
+	{
+		if (OptionalRelevantTags)
+		{
+			OptionalRelevantTags->AddTag(WoWCloneTags::AbilityFail_Blocked);
+		}
+
+		return false;
+	}
+
+	UAnimInstance* AnimInstance = GetAnimInstance();
+	if (!AnimInstance)
+	{
+		if (OptionalRelevantTags)
+		{
+			OptionalRelevantTags->AddTag(WoWCloneTags::AbilityFail_Blocked);
+		}
+
+		return false;
+	}
+
+	ActiveAbilityCast.Reset();
+	ActiveAbilityCast.Config = CastConfig;
+	ActiveAbilityCast.SourceAbility = SourceAbility;
+	ActiveAbilityCast.StartWorldTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
+
+	if (const UBaseGameplayAbility* BaseAbility = Cast<UBaseGameplayAbility>(SourceAbility))
+	{
+		ActiveAbilityCast.AbilityName = BaseAbility->AbilityName.IsEmpty()
+			? FText::FromString(SourceAbility->GetClass()->GetName())
+			: BaseAbility->AbilityName;
+	}
+	else
+	{
+		ActiveAbilityCast.AbilityName = FText::FromString(SourceAbility->GetClass()->GetName());
+	}
+
+	SetAbilityCastingTag(true);
+	BroadcastAbilityCastState();
+	return true;
+}
+
+void UCombatComponent::EndAbilityCast(UGameplayAbility* SourceAbility)
+{
+	if (!ActiveAbilityCast.IsActive())
 	{
 		return;
 	}
 
-	ApplyMeleeHitToActor(OtherActor);
+	if (SourceAbility && ActiveAbilityCast.SourceAbility.Get() != SourceAbility)
+	{
+		return;
+	}
+
+	ClearAbilityCastState(true);
+}
+
+bool UCombatComponent::NotifyAbilityCastCommit(const UAnimMontage* SourceMontage, TSubclassOf<UAnimNotify> NotifyClass)
+{
+	if (!HasInterruptibleAbilityCast())
+	{
+		return false;
+	}
+
+	if (ActiveAbilityCast.Config.CastMontage != SourceMontage
+		|| ActiveAbilityCast.Config.CommitNotifyClass != NotifyClass)
+	{
+		return false;
+	}
+
+	UBaseGameplayAbility* BaseAbility = Cast<UBaseGameplayAbility>(ActiveAbilityCast.SourceAbility.Get());
+	if (BaseAbility && !BaseAbility->CommitAbilityFromAnimation())
+	{
+		InterruptAbilityCast(ActiveAbilityCast.Config.InterruptBlendOutTime, TEXT("commit failure"));
+		return false;
+	}
+
+	if (BaseAbility)
+	{
+		BaseAbility->HandleAbilityAnimationCommit(SourceMontage);
+	}
+
+	ActiveAbilityCast.bHasCommitted = true;
+	SetAbilityCastingTag(false);
+	BroadcastAbilityCastState();
+	return true;
+}
+
+void UCombatComponent::HandleReceivedDamage(float AppliedDamage)
+{
+	if (AppliedDamage <= 0.0f)
+	{
+		return;
+	}
+}
+
+FAbilityCastState UCombatComponent::GetAbilityCastState() const
+{
+	FAbilityCastState CastState;
+	if (!HasInterruptibleAbilityCast())
+	{
+		return CastState;
+	}
+
+	CastState.bIsCasting = true;
+	CastState.AbilityName = ActiveAbilityCast.AbilityName;
+	CastState.TotalDuration = ActiveAbilityCast.Config.CastDuration;
+
+	if (const UWorld* World = GetWorld())
+	{
+		CastState.ElapsedTime = FMath::Clamp(World->GetTimeSeconds() - ActiveAbilityCast.StartWorldTime, 0.0f, CastState.TotalDuration);
+	}
+
+	CastState.RemainingTime = FMath::Max(0.0f, CastState.TotalDuration - CastState.ElapsedTime);
+	return CastState;
 }
 
 bool UCombatComponent::CanPerformAttack() const
 {
-	if (!OwnerCharacter) return false;
+	if (!OwnerCharacter)
+	{
+		return false;
+	}
 
-	UInventoryComponent* Inv = GetInventoryComponent();
-	if (!Inv || Inv->IsWeaponActionInProgress()) return false;
+	if (HasInterruptibleAbilityCast())
+	{
+		return false;
+	}
 
-	// Requirement: Weapon must be in slot and physically drawn
-	const bool bHasWeapon = Inv->HasItemEquippedAtSlot(EEquipmentSlot::MainHand);
-	const bool bIsArmed = OwnerCharacter->HasWeaponEquipped();
+	const UWeaponActionComponent* WeaponActionComp = GetWeaponActionComponent();
+	const UEquipmentComponent* EquipmentComp = GetEquipmentComponent();
+	if (!WeaponActionComp || !EquipmentComp || WeaponActionComp->IsWeaponActionInProgress())
+	{
+		return false;
+	}
 
+	const bool bHasWeapon = EquipmentComp->HasItemEquippedAtSlot(EEquipmentSlot::MainHand);
+	const bool bIsArmed = EquipmentComp->HasWeaponEquipped();
 	return bHasWeapon && bIsArmed;
 }
 
-void UCombatComponent::HandleComboInput()
+bool UCombatComponent::TryPrepareAbilityAreaImpactActivation(UAnimInstance* AnimInstance)
 {
-	UE_LOG(LogCombatSystem, Log, TEXT("Advancing Combo. Index: %d"), CurrentComboIndex);
-	ClearBufferedAttackInput();
-	ExecuteNextComboStep();
+	if (!AnimInstance)
+	{
+		return false;
+	}
+
+	if (!AnimInstance->IsAnyMontagePlaying())
+	{
+		return true;
+	}
+
+	const UAnimMontage* AttackMontage = ResolveInterruptibleMontage(AnimInstance, ActiveAbilityInterruptWindows);
+	if (!AttackMontage)
+	{
+		return false;
+	}
+
+	UE_LOG(LogCombatSystem, Log, TEXT("Attack montage interrupted by ability area impact activation."));
+	InterruptAttackMontage(AnimInstance, AttackMontage, ResolveInterruptBlendOutTime(AttackMontage, ActiveAbilityInterruptWindows));
+	return true;
 }
 
-void UCombatComponent::HandleInitialInput()
+void UCombatComponent::BeginInterruptWindow(TMap<const UAnimNotifyState*, FAttackInterruptWindowState>& WindowStates, const UAnimNotifyState* WindowSource, const UAnimMontage* AttackMontage, float InBlendOutTime)
+{
+	if (!WindowSource || !AttackMontage)
+	{
+		return;
+	}
+
+	FAttackInterruptWindowState& WindowState = WindowStates.FindOrAdd(WindowSource);
+	WindowState.Montage = AttackMontage;
+	WindowState.BlendOutTime = FMath::Max(0.0f, InBlendOutTime);
+	++WindowState.ActiveCount;
+}
+
+void UCombatComponent::EndInterruptWindow(TMap<const UAnimNotifyState*, FAttackInterruptWindowState>& WindowStates, const UAnimNotifyState* WindowSource)
+{
+	if (!WindowSource)
+	{
+		return;
+	}
+
+	if (FAttackInterruptWindowState* WindowState = WindowStates.Find(WindowSource))
+	{
+		WindowState->ActiveCount = FMath::Max(0, WindowState->ActiveCount - 1);
+		if (WindowState->ActiveCount == 0)
+		{
+			WindowStates.Remove(WindowSource);
+		}
+	}
+}
+
+void UCombatComponent::InterruptAttackMontage(UAnimInstance* AnimInstance, const UAnimMontage* AttackMontage, float BlendOutTime)
+{
+	if (!AnimInstance || !AttackMontage)
+	{
+		return;
+	}
+
+	AnimInstance->Montage_Stop(BlendOutTime, AttackMontage);
+	ClearInterruptWindowsForMontage(ActiveAttackInterruptWindows, AttackMontage);
+	ClearInterruptWindowsForMontage(ActiveAbilityInterruptWindows, AttackMontage);
+
+	if (UCombatImpactComponent* CombatImpactComp = GetCombatImpactComponent())
+	{
+		CombatImpactComp->ClearMeleeHitWindowsForMontage(AttackMontage);
+		CombatImpactComp->ClearCurrentAttackMontage(AttackMontage);
+	}
+
+	CurrentAttackMontage.Reset();
+	ResetCombo();
+	ClearBufferedAttackInput();
+}
+
+bool UCombatComponent::CanAdvanceComboForAttackType(ECombatAttackType AttackType) const
+{
+	if (!bCanAdvanceCombo)
+	{
+		return false;
+	}
+
+	return AttackType == ECombatAttackType::Heavy ? bCanAdvanceHeavyCombo : bCanAdvanceLightCombo;
+}
+
+void UCombatComponent::HandleComboInput(ECombatAttackType AttackType)
+{
+	UE_LOG(LogCombatSystem, Log, TEXT("Advancing %s combo. Index: %d"), AttackType == ECombatAttackType::Heavy ? TEXT("Heavy Attack") : TEXT("Light Attack"), CurrentComboIndex);
+	ClearBufferedAttackInput();
+	ExecuteNextComboStep(AttackType);
+}
+
+void UCombatComponent::HandleInitialInput(ECombatAttackType AttackType)
 {
 	UAnimInstance* AnimInstance = GetAnimInstance();
-	if (!AnimInstance || AnimInstance->IsAnyMontagePlaying()) return;
+	if (!AnimInstance || AnimInstance->IsAnyMontagePlaying())
+	{
+		return;
+	}
 
 	ClearBufferedAttackInput();
-	ResetCombo();
-	ExecuteNextComboStep();
+	RefreshCurrentComboIndex(AttackType);
+	ExecuteNextComboStep(AttackType);
 }
 
-void UCombatComponent::ExecuteNextComboStep()
+void UCombatComponent::ExecuteNextComboStep(ECombatAttackType AttackType)
 {
 	UWeaponDataAsset* WeaponData = GetEquippedWeaponData();
-	
-	// Phase 1: Logic Validation
-	if (!IsComboStateValid(WeaponData)) return;
-
-	// Phase 2: State Processing
-	AdvanceComboState(WeaponData);
-
-	// Phase 3: Execution
-	PlayComboAttack(WeaponData, CurrentComboIndex - 1);
-}
-
-bool UCombatComponent::IsComboStateValid(const UWeaponDataAsset* WeaponData) const
-{
-	if (!WeaponData) return false;
-
-	return WeaponData->WeaponData.ComboData.ComboMontages.Num() > 0;
-}
-
-void UCombatComponent::AdvanceComboState(const UWeaponDataAsset* WeaponData)
-{
-	const int32 MaxCombos = WeaponData->WeaponData.ComboData.ComboMontages.Num();
-
-	// Cycle logic: Wrap around if we exceed the defined combo length
-	if (CurrentComboIndex >= MaxCombos)
+	const FCombatComboData* ComboData = GetComboDataForAttackType(WeaponData, AttackType);
+	if (!IsComboStateValid(ComboData))
 	{
-		ResetCombo();
+		return;
 	}
 
-	CurrentComboIndex++;
-	bCanAdvanceCombo = false; // Close the window until next ANS_ComboWindow NotifyBegin
-
-	UE_LOG(LogCombatSystem, Log, TEXT("Combo State Advanced. Next Index: %d"), CurrentComboIndex);
+	AdvanceComboState(*ComboData, AttackType);
+	PlayComboAttack(WeaponData, AttackType, GetComboIndexForAttackType(AttackType) - 1);
 }
 
-void UCombatComponent::PlayComboAttack(UWeaponDataAsset* WeaponData, int32 Index)
+bool UCombatComponent::IsComboStateValid(const FCombatComboData* ComboData) const
 {
-	if (!WeaponData || !OwnerCharacter) return;
+	return ComboData && ComboData->ComboMontages.Num() > 0;
+}
 
-	const TArray<TSoftObjectPtr<UAnimMontage>>& Combos = WeaponData->WeaponData.ComboData.ComboMontages;
-	
-	if (Combos.IsValidIndex(Index))
+void UCombatComponent::AdvanceComboState(const FCombatComboData& ComboData, ECombatAttackType AttackType)
+{
+	int32& AttackTypeComboIndex = GetMutableComboIndexForAttackType(AttackType);
+	const int32 MaxCombos = ComboData.ComboMontages.Num();
+	if (AttackTypeComboIndex >= MaxCombos)
 	{
-		const TSoftObjectPtr<UAnimMontage>& ComboMontage = Combos[Index];
-		if (ComboMontage.IsPending())
-		{
-			RequestComboMontageLoad(WeaponData, Index);
-		}
-		else if (ComboMontage.IsValid())
-		{
-			ClearPendingComboRequest();
-			RecordPlayedAttackMontage(ComboMontage.Get(), OwnerCharacter->PlayAnimMontage(ComboMontage.Get()));
-		}
+		AttackTypeComboIndex = 0;
+	}
+
+	++AttackTypeComboIndex;
+	RefreshCurrentComboIndex(AttackType);
+	bCanAdvanceCombo = false;
+	ActiveAttackType = AttackType;
+	bHasActiveAttackType = true;
+
+	UE_LOG(LogCombatSystem, Log, TEXT("%s combo state advanced. Next Index: %d"), AttackType == ECombatAttackType::Heavy ? TEXT("Heavy Attack") : TEXT("Light Attack"), GetComboIndexForAttackType(AttackType));
+}
+
+void UCombatComponent::PlayComboAttack(UWeaponDataAsset* WeaponData, ECombatAttackType AttackType, int32 Index)
+{
+	if (!WeaponData || !OwnerCharacter)
+	{
+		return;
+	}
+
+	const FCombatComboData* ComboData = GetComboDataForAttackType(WeaponData, AttackType);
+	if (!ComboData)
+	{
+		return;
+	}
+
+	const TArray<TSoftObjectPtr<UAnimMontage>>& Combos = ComboData->ComboMontages;
+	if (!Combos.IsValidIndex(Index))
+	{
+		return;
+	}
+
+	const TSoftObjectPtr<UAnimMontage>& ComboMontage = Combos[Index];
+	if (ComboMontage.IsPending())
+	{
+		RequestComboMontageLoad(WeaponData, AttackType, Index);
+		return;
+	}
+
+	if (ComboMontage.IsValid())
+	{
+		ClearPendingComboRequest();
+		RecordPlayedAttackMontage(ComboMontage.Get(), OwnerCharacter->PlayAnimMontage(ComboMontage.Get()), GetComboStepKnockbackConfig(ComboData, Index));
 	}
 }
 
-void UCombatComponent::RequestComboMontageLoad(UWeaponDataAsset* WeaponData, int32 Index)
+void UCombatComponent::RequestComboMontageLoad(UWeaponDataAsset* WeaponData, ECombatAttackType AttackType, int32 Index)
 {
-	if (!WeaponData) return;
+	if (!WeaponData)
+	{
+		return;
+	}
 
-	const TArray<TSoftObjectPtr<UAnimMontage>>& Combos = WeaponData->WeaponData.ComboData.ComboMontages;
+	const FCombatComboData* ComboData = GetComboDataForAttackType(WeaponData, AttackType);
+	if (!ComboData)
+	{
+		return;
+	}
+
+	const TArray<TSoftObjectPtr<UAnimMontage>>& Combos = ComboData->ComboMontages;
 	if (!Combos.IsValidIndex(Index))
 	{
 		return;
 	}
 
 	PendingComboWeaponData = WeaponData;
+	PendingComboAttackType = AttackType;
 	PendingComboMontageIndex = Index;
+	bHasPendingComboRequest = true;
 
-	FStreamableDelegate Delegate = FStreamableDelegate::CreateUObject(this, &UCombatComponent::OnComboMontageLoaded, WeaponData, Index);
+	FStreamableDelegate Delegate = FStreamableDelegate::CreateUObject(this, &UCombatComponent::OnComboMontageLoaded, WeaponData, AttackType, Index);
 	UAssetManager::GetStreamableManager().RequestAsyncLoad(Combos[Index].ToSoftObjectPath(), Delegate);
 }
 
-void UCombatComponent::OnComboMontageLoaded(UWeaponDataAsset* WeaponData, int32 Index)
+void UCombatComponent::OnComboMontageLoaded(UWeaponDataAsset* WeaponData, ECombatAttackType AttackType, int32 Index)
 {
-	if (!OwnerCharacter || PendingComboWeaponData.Get() != WeaponData || PendingComboMontageIndex != Index || GetEquippedWeaponData() != WeaponData)
+	if (!bHasPendingComboRequest
+		|| PendingComboWeaponData.Get() != WeaponData
+		|| PendingComboAttackType != AttackType
+		|| PendingComboMontageIndex != Index)
 	{
+		return;
+	}
+
+	if (!OwnerCharacter || GetEquippedWeaponData() != WeaponData)
+	{
+		ClearPendingComboRequest();
 		return;
 	}
 
@@ -314,50 +702,152 @@ void UCombatComponent::OnComboMontageLoaded(UWeaponDataAsset* WeaponData, int32 
 	{
 		if (AnimInstance->IsAnyMontagePlaying())
 		{
+			const UAnimMontage* ActiveAttackMontage = CurrentAttackMontage.Get();
+			if (ActiveAttackMontage && AnimInstance->Montage_IsPlaying(ActiveAttackMontage))
+			{
+				return;
+			}
+
+			ClearPendingComboRequest();
 			return;
 		}
 	}
 
-	const TArray<TSoftObjectPtr<UAnimMontage>>& Combos = WeaponData->WeaponData.ComboData.ComboMontages;
+	const FCombatComboData* ComboData = GetComboDataForAttackType(WeaponData, AttackType);
+	if (!ComboData)
+	{
+		ClearPendingComboRequest();
+		return;
+	}
+
+	const TArray<TSoftObjectPtr<UAnimMontage>>& Combos = ComboData->ComboMontages;
 	if (Combos.IsValidIndex(Index) && Combos[Index].IsValid())
 	{
 		ClearPendingComboRequest();
-		RecordPlayedAttackMontage(Combos[Index].Get(), OwnerCharacter->PlayAnimMontage(Combos[Index].Get()));
+		RecordPlayedAttackMontage(Combos[Index].Get(), OwnerCharacter->PlayAnimMontage(Combos[Index].Get()), GetComboStepKnockbackConfig(ComboData, Index));
+		return;
 	}
+
+	ClearPendingComboRequest();
 }
 
 UWeaponDataAsset* UCombatComponent::GetEquippedWeaponData() const
 {
-	UInventoryComponent* Inventory = GetInventoryComponent();
-	if (Inventory)
+	if (const UEquipmentComponent* EquipmentComp = GetEquipmentComponent())
 	{
-		return Cast<UWeaponDataAsset>(Inventory->GetEquippedItem(EEquipmentSlot::MainHand));
+		return Cast<UWeaponDataAsset>(EquipmentComp->GetEquippedItem(EEquipmentSlot::MainHand));
 	}
+
 	return nullptr;
 }
 
-UInventoryComponent* UCombatComponent::GetInventoryComponent() const
+const FCombatComboData* UCombatComponent::GetComboDataForAttackType(const UWeaponDataAsset* WeaponData, ECombatAttackType AttackType) const
 {
-	if (!CachedInventory.IsValid() && OwnerCharacter)
+	if (!WeaponData)
 	{
-		CachedInventory = OwnerCharacter->FindComponentByClass<UInventoryComponent>();
+		return nullptr;
 	}
-	return CachedInventory.Get();
+
+	return AttackType == ECombatAttackType::Heavy
+		? &WeaponData->WeaponData.HeavyAttackComboData
+		: &WeaponData->WeaponData.ComboData;
+}
+
+FMeleeKnockbackConfig UCombatComponent::GetComboStepKnockbackConfig(const FCombatComboData* ComboData, int32 Index) const
+{
+	if (!ComboData || !ComboData->ComboStepKnockbackConfigs.IsValidIndex(Index))
+	{
+		return FMeleeKnockbackConfig();
+	}
+
+	return ComboData->ComboStepKnockbackConfigs[Index];
+}
+
+int32 UCombatComponent::GetComboIndexForAttackType(ECombatAttackType AttackType) const
+{
+	return AttackType == ECombatAttackType::Heavy ? HeavyComboIndex : LightComboIndex;
+}
+
+int32& UCombatComponent::GetMutableComboIndexForAttackType(ECombatAttackType AttackType)
+{
+	return AttackType == ECombatAttackType::Heavy ? HeavyComboIndex : LightComboIndex;
+}
+
+void UCombatComponent::RefreshCurrentComboIndex(ECombatAttackType AttackType)
+{
+	CurrentComboIndex = GetComboIndexForAttackType(AttackType);
+}
+
+void UCombatComponent::ResetComboState(ECombatAttackType AttackType)
+{
+	GetMutableComboIndexForAttackType(AttackType) = 0;
+
+	if (bHasActiveAttackType && ActiveAttackType == AttackType)
+	{
+		RefreshCurrentComboIndex(AttackType);
+	}
+}
+
+UEquipmentComponent* UCombatComponent::GetEquipmentComponent() const
+{
+	if (!CachedEquipment.IsValid() && OwnerCharacter)
+	{
+		CachedEquipment = OwnerCharacter->FindComponentByClass<UEquipmentComponent>();
+	}
+
+	return CachedEquipment.Get();
+}
+
+UCombatImpactComponent* UCombatComponent::GetCombatImpactComponent() const
+{
+	if (!CachedCombatImpact.IsValid() && OwnerCharacter)
+	{
+		CachedCombatImpact = OwnerCharacter->FindComponentByClass<UCombatImpactComponent>();
+	}
+
+	return CachedCombatImpact.Get();
+}
+
+UWeaponActionComponent* UCombatComponent::GetWeaponActionComponent() const
+{
+	if (!CachedWeaponAction.IsValid() && OwnerCharacter)
+	{
+		CachedWeaponAction = OwnerCharacter->FindComponentByClass<UWeaponActionComponent>();
+	}
+
+	return CachedWeaponAction.Get();
+}
+
+UHeroLocomotionComponent* UCombatComponent::GetHeroLocomotionComponent() const
+{
+	if (!CachedHeroLocomotion.IsValid() && OwnerCharacter)
+	{
+		CachedHeroLocomotion = OwnerCharacter->FindComponentByClass<UHeroLocomotionComponent>();
+	}
+
+	return CachedHeroLocomotion.Get();
 }
 
 UAnimInstance* UCombatComponent::GetAnimInstance() const
 {
-	if (!CachedAnimInstance.IsValid() && OwnerCharacter)
+	if (!CachedAnimInstance.IsValid() && OwnerCharacter && OwnerCharacter->GetMesh())
 	{
 		CachedAnimInstance = OwnerCharacter->GetMesh()->GetAnimInstance();
 	}
+
 	return CachedAnimInstance.Get();
 }
 
 void UCombatComponent::ResetCombo()
 {
 	CurrentComboIndex = 0;
+	ResetComboState(ECombatAttackType::Light);
+	ResetComboState(ECombatAttackType::Heavy);
+	ActiveComboWindows.Reset();
+	RefreshComboWindowState();
 	bCanAdvanceCombo = false;
+	bHasActiveAttackType = false;
+	ActiveAttackType = ECombatAttackType::Light;
 	ClearBufferedAttackInput();
 	ClearPendingComboRequest();
 }
@@ -365,10 +855,51 @@ void UCombatComponent::ResetCombo()
 void UCombatComponent::ClearPendingComboRequest()
 {
 	PendingComboWeaponData.Reset();
+	PendingComboAttackType = ECombatAttackType::Light;
 	PendingComboMontageIndex = INDEX_NONE;
+	bHasPendingComboRequest = false;
+
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(PendingComboRetryTimerHandle);
+	}
 }
 
-void UCombatComponent::BufferAttackInput()
+void UCombatComponent::SchedulePendingComboRetry()
+{
+	UWorld* World = GetWorld();
+	if (!World || !PendingComboWeaponData.IsValid() || PendingComboMontageIndex == INDEX_NONE)
+	{
+		return;
+	}
+
+	if (World->GetTimerManager().IsTimerActive(PendingComboRetryTimerHandle))
+	{
+		return;
+	}
+
+	FTimerDelegate RetryDelegate;
+	RetryDelegate.BindUObject(this, &UCombatComponent::RetryPendingComboRequest);
+	World->GetTimerManager().SetTimer(PendingComboRetryTimerHandle, RetryDelegate, KINDA_SMALL_NUMBER, false);
+}
+
+void UCombatComponent::RetryPendingComboRequest()
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(PendingComboRetryTimerHandle);
+	}
+
+	UWeaponDataAsset* PendingWeaponData = PendingComboWeaponData.Get();
+	if (!PendingWeaponData || PendingComboMontageIndex == INDEX_NONE || !bHasPendingComboRequest)
+	{
+		return;
+	}
+
+	OnComboMontageLoaded(PendingWeaponData, PendingComboAttackType, PendingComboMontageIndex);
+}
+
+void UCombatComponent::BufferAttackInput(ECombatAttackType AttackType)
 {
 	if (AttackInputBufferDuration <= 0.0f)
 	{
@@ -378,21 +909,23 @@ void UCombatComponent::BufferAttackInput()
 	if (const UWorld* World = GetWorld())
 	{
 		bBufferedAttackInput = true;
+		BufferedAttackType = AttackType;
 		BufferedAttackInputExpiryTime = World->GetTimeSeconds() + AttackInputBufferDuration;
 	}
 }
 
 void UCombatComponent::ConsumeBufferedAttackInput()
 {
-	if (bCanAdvanceCombo && HasBufferedAttackInput())
+	if (CanAdvanceComboForAttackType(BufferedAttackType) && HasBufferedAttackInput())
 	{
-		HandleComboInput();
+		HandleComboInput(BufferedAttackType);
 	}
 }
 
 void UCombatComponent::ClearBufferedAttackInput()
 {
 	bBufferedAttackInput = false;
+	BufferedAttackType = ECombatAttackType::Light;
 	BufferedAttackInputExpiryTime = 0.0f;
 }
 
@@ -407,30 +940,48 @@ bool UCombatComponent::HasBufferedAttackInput() const
 	return World && World->GetTimeSeconds() <= BufferedAttackInputExpiryTime;
 }
 
-void UCombatComponent::RecordPlayedAttackMontage(UAnimMontage* PlayedMontage, float PlayedDuration)
+void UCombatComponent::RecordPlayedAttackMontage(UAnimMontage* PlayedMontage, float PlayedDuration, const FMeleeKnockbackConfig& KnockbackConfig)
 {
-	if (PlayedMontage && PlayedDuration > 0.0f)
+	if (!PlayedMontage || PlayedDuration <= 0.0f)
 	{
-		CurrentAttackMontage = PlayedMontage;
+		return;
+	}
 
-		if (UAnimInstance* AnimInstance = GetAnimInstance())
-		{
-			FOnMontageBlendingOutStarted BlendOutDelegate;
-			BlendOutDelegate.BindUObject(this, &UCombatComponent::OnAttackMontageBlendingOut);
-			AnimInstance->Montage_SetBlendingOutDelegate(BlendOutDelegate, PlayedMontage);
-		}
+	CurrentAttackMontage = PlayedMontage;
+
+	if (UCombatImpactComponent* CombatImpactComp = GetCombatImpactComponent())
+	{
+		CombatImpactComp->SetCurrentAttackMontage(PlayedMontage, KnockbackConfig);
+	}
+
+	if (UAnimInstance* AnimInstance = GetAnimInstance())
+	{
+		FOnMontageBlendingOutStarted BlendOutDelegate;
+		BlendOutDelegate.BindUObject(this, &UCombatComponent::OnAttackMontageBlendingOut);
+		AnimInstance->Montage_SetBlendingOutDelegate(BlendOutDelegate, PlayedMontage);
 	}
 }
 
-void UCombatComponent::OnAttackMontageBlendingOut(UAnimMontage* AttackMontage, bool /*bInterrupted*/)
+void UCombatComponent::OnAttackMontageBlendingOut(UAnimMontage* AttackMontage, bool bInterrupted)
 {
+	(void)bInterrupted;
+
 	if (!AttackMontage)
 	{
 		return;
 	}
 
-	ClearAttackInterruptWindowsForMontage(AttackMontage);
-	ClearMeleeHitWindowsForMontage(AttackMontage);
+	ActiveComboWindows.Reset();
+	RefreshComboWindowState();
+	ClearInterruptWindowsForMontage(ActiveAttackInterruptWindows, AttackMontage);
+	ClearInterruptWindowsForMontage(ActiveAbilityInterruptWindows, AttackMontage);
+
+	if (UCombatImpactComponent* CombatImpactComp = GetCombatImpactComponent())
+	{
+		CombatImpactComp->ClearMeleeHitWindowsForMontage(AttackMontage);
+		CombatImpactComp->ClearCurrentAttackMontage(AttackMontage);
+	}
+
 	ClearBufferedAttackInput();
 
 	if (CurrentAttackMontage.Get() == AttackMontage)
@@ -438,20 +989,45 @@ void UCombatComponent::OnAttackMontageBlendingOut(UAnimMontage* AttackMontage, b
 		CurrentAttackMontage.Reset();
 	}
 
+	if (bHasActiveAttackType)
+	{
+		RefreshCurrentComboIndex(ActiveAttackType);
+	}
+
 	if (PendingComboWeaponData.IsValid() && PendingComboMontageIndex != INDEX_NONE)
 	{
-		OnComboMontageLoaded(PendingComboWeaponData.Get(), PendingComboMontageIndex);
+		SchedulePendingComboRetry();
 	}
 }
 
-void UCombatComponent::ClearAttackInterruptWindowsForMontage(const UAnimMontage* AttackMontage)
+void UCombatComponent::RefreshComboWindowState()
+{
+	bCanAdvanceCombo = false;
+	bCanAdvanceLightCombo = false;
+	bCanAdvanceHeavyCombo = false;
+
+	for (const TPair<const UAnimNotifyState*, FComboWindowRuntimeState>& Entry : ActiveComboWindows)
+	{
+		if (Entry.Value.ActiveCount <= 0)
+		{
+			continue;
+		}
+
+		bCanAdvanceLightCombo |= Entry.Value.Request.bAllowLightAttack;
+		bCanAdvanceHeavyCombo |= Entry.Value.Request.bAllowHeavyAttack;
+	}
+
+	bCanAdvanceCombo = bCanAdvanceLightCombo || bCanAdvanceHeavyCombo;
+}
+
+void UCombatComponent::ClearInterruptWindowsForMontage(TMap<const UAnimNotifyState*, FAttackInterruptWindowState>& WindowStates, const UAnimMontage* AttackMontage)
 {
 	if (!AttackMontage)
 	{
 		return;
 	}
 
-	for (auto It = ActiveAttackInterruptWindows.CreateIterator(); It; ++It)
+	for (auto It = WindowStates.CreateIterator(); It; ++It)
 	{
 		if (It.Value().Montage == AttackMontage)
 		{
@@ -460,350 +1036,7 @@ void UCombatComponent::ClearAttackInterruptWindowsForMontage(const UAnimMontage*
 	}
 }
 
-void UCombatComponent::ClearMeleeHitWindowsForMontage(const UAnimMontage* AttackMontage)
-{
-	if (!AttackMontage)
-	{
-		return;
-	}
-
-	for (auto It = ActiveMeleeHitWindows.CreateIterator(); It; ++It)
-	{
-		if (It.Value().Montage == AttackMontage)
-		{
-			It.RemoveCurrent();
-		}
-	}
-
-	RefreshWeaponHitCollisionState();
-}
-
-void UCombatComponent::RefreshWeaponHitCollisionState()
-{
-	if (!OwnerCharacter)
-	{
-		return;
-	}
-
-	bool bShouldEnableCollision = false;
-	const UAnimMontage* AttackMontage = CurrentAttackMontage.Get();
-
-	if (AttackMontage)
-	{
-		if (UAnimInstance* AnimInstance = GetAnimInstance(); AnimInstance && AnimInstance->Montage_IsPlaying(AttackMontage))
-		{
-			for (const TPair<const UAnimNotifyState*, FMeleeHitWindowState>& Entry : ActiveMeleeHitWindows)
-			{
-				const FMeleeHitWindowState& WindowState = Entry.Value;
-				if (WindowState.ActiveCount > 0 && WindowState.Montage == AttackMontage)
-				{
-					bShouldEnableCollision = true;
-					break;
-				}
-			}
-		}
-	}
-
-	if (!bShouldEnableCollision)
-	{
-		HitActorsInActiveMeleeWindow.Reset();
-		ResetReliableMeleeTraceState();
-	}
-
-	const bool bShouldRunReliableTracing = bShouldEnableCollision && bEnableReliableMeleeTracing;
-	SetComponentTickEnabled(bShouldRunReliableTracing);
-
-	if (bShouldRunReliableTracing)
-	{
-		if (!bHasReliableTraceOrigin)
-		{
-			PreviousReliableTraceOrigin = ResolveMeleeTraceOrigin();
-			bHasReliableTraceOrigin = true;
-		}
-	}
-
-	OwnerCharacter->SetMeleeHitCollisionEnabled(bShouldEnableCollision);
-}
-
-bool UCombatComponent::CanRegisterMeleeHit(AActor* OtherActor) const
-{
-	if (!OwnerCharacter || !IsValid(OtherActor) || OtherActor == OwnerCharacter || ActiveMeleeHitWindows.IsEmpty())
-	{
-		return false;
-	}
-
-	if (HitActorsInActiveMeleeWindow.Contains(TObjectKey<AActor>(OtherActor)))
-	{
-		return false;
-	}
-
-	const ACharacterBase* TargetCharacter = Cast<ACharacterBase>(OtherActor);
-	return TargetCharacter && OtherActor->CanBeDamaged();
-}
-
-void UCombatComponent::TraceReliableMeleeHits()
-{
-	if (!OwnerCharacter)
-	{
-		return;
-	}
-
-	UPrimitiveComponent* HitCollisionComp = OwnerCharacter->GetMeleeHitCollisionComponent();
-	if (!HitCollisionComp)
-	{
-		ResetReliableMeleeTraceState();
-		return;
-	}
-
-	const FVector CurrentTraceOrigin = ResolveMeleeTraceOrigin();
-	if (!bHasReliableTraceOrigin)
-	{
-		PreviousReliableTraceOrigin = CurrentTraceOrigin;
-		bHasReliableTraceOrigin = true;
-		return;
-	}
-
-	if (CurrentTraceOrigin.Equals(PreviousReliableTraceOrigin, 0.1f))
-	{
-		return;
-	}
-
-	UWorld* World = GetWorld();
-	if (!World)
-	{
-		return;
-	}
-
-	TArray<FHitResult> HitResults;
-	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(ReliableMeleeHitTrace), false, OwnerCharacter);
-	QueryParams.AddIgnoredComponent(HitCollisionComp);
-
-	World->SweepMultiByChannel(
-		HitResults,
-		PreviousReliableTraceOrigin,
-		CurrentTraceOrigin,
-		FQuat::Identity,
-		ECC_Pawn,
-		FCollisionShape::MakeSphere(ResolveMeleeTraceRadius()),
-		QueryParams);
-
-	for (const FHitResult& HitResult : HitResults)
-	{
-		if (AActor* HitActor = HitResult.GetActor(); CanRegisterMeleeHit(HitActor))
-		{
-			ApplyMeleeHitToActor(HitActor);
-		}
-	}
-
-	PreviousReliableTraceOrigin = CurrentTraceOrigin;
-}
-
-void UCombatComponent::ResetReliableMeleeTraceState()
-{
-	bHasReliableTraceOrigin = false;
-	PreviousReliableTraceOrigin = FVector::ZeroVector;
-}
-
-float UCombatComponent::ResolveOutgoingMeleeDamage(bool& bOutIsCriticalHit) const
-{
-	bOutIsCriticalHit = false;
-
-	if (!OwnerCharacter)
-	{
-		return 0.0f;
-	}
-
-	const UAbilitySystemComponent* SourceASC = OwnerCharacter->GetAbilitySystemComponent();
-	if (!SourceASC)
-	{
-		return 0.0f;
-	}
-
-	const float BaseDamage = FMath::Max(1.0f, SourceASC->GetNumericAttribute(UCharacterAttributeSet::GetAttackDamageAttribute()));
-	bOutIsCriticalHit = RollCriticalHit();
-	return bOutIsCriticalHit ? (BaseDamage * CriticalDamageMultiplier) : BaseDamage;
-}
-
-bool UCombatComponent::RollCriticalHit() const
-{
-	if (!OwnerCharacter)
-	{
-		return false;
-	}
-
-	const UAbilitySystemComponent* SourceASC = OwnerCharacter->GetAbilitySystemComponent();
-	if (!SourceASC)
-	{
-		return false;
-	}
-
-	const float CriticalStrikeChance = FMath::Clamp(SourceASC->GetNumericAttribute(UCharacterAttributeSet::GetCriticalStrikeChanceAttribute()), 0.0f, 100.0f);
-	return CriticalStrikeChance > 0.0f && FMath::FRandRange(0.0f, 100.0f) <= CriticalStrikeChance;
-}
-
-FVector UCombatComponent::ResolveMeleeTraceOrigin() const
-{
-	if (OwnerCharacter)
-	{
-		if (const UPrimitiveComponent* HitCollisionComp = OwnerCharacter->GetMeleeHitCollisionComponent())
-		{
-			return HitCollisionComp->Bounds.Origin;
-		}
-	}
-
-	return FVector::ZeroVector;
-}
-
-float UCombatComponent::ResolveMeleeTraceRadius() const
-{
-	if (OwnerCharacter)
-	{
-		if (const UPrimitiveComponent* HitCollisionComp = OwnerCharacter->GetMeleeHitCollisionComponent())
-		{
-			const float RawRadius = HitCollisionComp->Bounds.SphereRadius * ReliableMeleeTraceRadiusScale;
-			return FMath::Clamp(RawRadius, ReliableMeleeTraceMinRadius, ReliableMeleeTraceMaxRadius);
-		}
-	}
-
-	return ReliableMeleeTraceMinRadius;
-}
-
-void UCombatComponent::ApplyMeleeHitToActor(AActor* HitActor)
-{
-	if (!HitActor || !OwnerCharacter)
-	{
-		return;
-	}
-
-	bool bIsCriticalHit = false;
-	const float Damage = ResolveOutgoingMeleeDamage(bIsCriticalHit);
-	if (Damage <= 0.0f)
-	{
-		return;
-	}
-
-	FWoWCloneCombatDamageEvent DamageEvent(bIsCriticalHit);
-	const float AppliedDamage = HitActor->TakeDamage(Damage, DamageEvent, OwnerCharacter->GetController(), OwnerCharacter);
-	if (AppliedDamage <= 0.0f)
-	{
-		return;
-	}
-
-	HitActorsInActiveMeleeWindow.Add(TObjectKey<AActor>(HitActor));
-	TryPlayHitCameraShake();
-	TryApplyHitStop(HitActor);
-
-	UE_LOG(LogCombatSystem, Log, TEXT("Melee hit registered. Target: %s Damage: %.2f Crit: %s"), *GetNameSafe(HitActor), AppliedDamage, bIsCriticalHit ? TEXT("True") : TEXT("False"));
-}
-
-void UCombatComponent::TryPlayHitCameraShake() const
-{
-	const UWeaponDataAsset* WeaponData = GetEquippedWeaponData();
-	if (!WeaponData || !OwnerCharacter)
-	{
-		return;
-	}
-
-	const FWeaponData& WeaponConfig = WeaponData->WeaponData;
-	if (!WeaponConfig.HitCameraShakeClass || WeaponConfig.HitCameraShakeScale <= 0.0f)
-	{
-		return;
-	}
-
-	if (APlayerController* PlayerController = Cast<APlayerController>(OwnerCharacter->GetController()))
-	{
-		PlayerController->ClientStartCameraShake(WeaponConfig.HitCameraShakeClass, WeaponConfig.HitCameraShakeScale);
-	}
-}
-
-void UCombatComponent::TryApplyHitStop(AActor* HitActor)
-{
-	const UWeaponDataAsset* WeaponData = GetEquippedWeaponData();
-	if (!WeaponData || !OwnerCharacter || !HitActor)
-	{
-		return;
-	}
-
-	const FWeaponData& WeaponConfig = WeaponData->WeaponData;
-	if (!WeaponConfig.bEnableHitStop || WeaponConfig.HitStopDuration <= 0.0f || WeaponConfig.HitStopTimeDilation >= 1.0f)
-	{
-		return;
-	}
-
-	RestoreActiveHitStop();
-
-	auto AddHitStopActor = [this, &WeaponConfig](AActor* Actor)
-	{
-		if (!IsValid(Actor))
-		{
-			return;
-		}
-
-		for (const FHitStopActorState& ExistingState : ActiveHitStopActors)
-		{
-			if (ExistingState.Actor.Get() == Actor)
-			{
-				return;
-			}
-		}
-
-		FHitStopActorState& ActorState = ActiveHitStopActors.AddDefaulted_GetRef();
-		ActorState.Actor = Actor;
-		ActorState.PreviousCustomTimeDilation = Actor->CustomTimeDilation;
-		Actor->CustomTimeDilation = WeaponConfig.HitStopTimeDilation;
-	};
-
-	AddHitStopActor(OwnerCharacter);
-	AddHitStopActor(HitActor);
-
-	if (ActiveHitStopActors.IsEmpty())
-	{
-		return;
-	}
-
-	if (UWorld* World = GetWorld())
-	{
-		++ActiveHitStopRequestId;
-
-		FTimerDelegate RestoreDelegate;
-		RestoreDelegate.BindUObject(this, &UCombatComponent::RestoreHitStop, ActiveHitStopRequestId);
-		World->GetTimerManager().SetTimer(HitStopRestoreTimerHandle, RestoreDelegate, WeaponConfig.HitStopDuration, false);
-	}
-	else
-	{
-		RestoreActiveHitStop();
-	}
-}
-
-void UCombatComponent::RestoreHitStop(int32 HitStopRequestId)
-{
-	if (HitStopRequestId != ActiveHitStopRequestId)
-	{
-		return;
-	}
-
-	RestoreActiveHitStop();
-}
-
-void UCombatComponent::RestoreActiveHitStop()
-{
-	if (UWorld* World = GetWorld())
-	{
-		World->GetTimerManager().ClearTimer(HitStopRestoreTimerHandle);
-	}
-
-	for (const FHitStopActorState& ActorState : ActiveHitStopActors)
-	{
-		if (AActor* Actor = ActorState.Actor.Get())
-		{
-			Actor->CustomTimeDilation = ActorState.PreviousCustomTimeDilation;
-		}
-	}
-
-	ActiveHitStopActors.Reset();
-}
-
-const UAnimMontage* UCombatComponent::ResolveInterruptibleAttackMontage(UAnimInstance* AnimInstance) const
+const UAnimMontage* UCombatComponent::ResolveInterruptibleMontage(UAnimInstance* AnimInstance, const TMap<const UAnimNotifyState*, FAttackInterruptWindowState>& WindowStates) const
 {
 	const UAnimMontage* AttackMontage = CurrentAttackMontage.Get();
 	if (!AttackMontage || !AnimInstance->Montage_IsPlaying(AttackMontage))
@@ -811,7 +1044,7 @@ const UAnimMontage* UCombatComponent::ResolveInterruptibleAttackMontage(UAnimIns
 		return nullptr;
 	}
 
-	for (const TPair<const UAnimNotifyState*, FAttackInterruptWindowState>& Entry : ActiveAttackInterruptWindows)
+	for (const TPair<const UAnimNotifyState*, FAttackInterruptWindowState>& Entry : WindowStates)
 	{
 		const FAttackInterruptWindowState& WindowState = Entry.Value;
 		if (WindowState.ActiveCount > 0 && WindowState.Montage == AttackMontage)
@@ -823,12 +1056,12 @@ const UAnimMontage* UCombatComponent::ResolveInterruptibleAttackMontage(UAnimIns
 	return nullptr;
 }
 
-float UCombatComponent::ResolveInterruptBlendOutTime(const UAnimMontage* AttackMontage) const
+float UCombatComponent::ResolveInterruptBlendOutTime(const UAnimMontage* AttackMontage, const TMap<const UAnimNotifyState*, FAttackInterruptWindowState>& WindowStates) const
 {
 	float BlendOutTime = 0.25f;
 	bool bFoundMatchingWindow = false;
 
-	for (const TPair<const UAnimNotifyState*, FAttackInterruptWindowState>& Entry : ActiveAttackInterruptWindows)
+	for (const TPair<const UAnimNotifyState*, FAttackInterruptWindowState>& Entry : WindowStates)
 	{
 		const FAttackInterruptWindowState& WindowState = Entry.Value;
 		if (WindowState.ActiveCount > 0 && WindowState.Montage == AttackMontage)
@@ -841,3 +1074,144 @@ float UCombatComponent::ResolveInterruptBlendOutTime(const UAnimMontage* AttackM
 	return BlendOutTime;
 }
 
+void UCombatComponent::EnterCombatState(UAbilitySystemComponent* AbilitySystemComponent)
+{
+	HandleCombatTagChange(AbilitySystemComponent, true);
+	ApplyCombatStateMovementOverrides();
+}
+
+void UCombatComponent::ExitCombatState(UAbilitySystemComponent* AbilitySystemComponent)
+{
+	HandleCombatTagChange(AbilitySystemComponent, false);
+	RevertCombatStateMovementOverrides();
+}
+
+void UCombatComponent::HandleCombatTagChange(UAbilitySystemComponent* AbilitySystemComponent, bool bEnteringCombat)
+{
+	if (!AbilitySystemComponent)
+	{
+		return;
+	}
+
+	const FGameplayTag& TagToRemove = bEnteringCombat ? WoWCloneTags::State_Uncombat : WoWCloneTags::State_Combat;
+	const FGameplayTag& TagToAdd = bEnteringCombat ? WoWCloneTags::State_Combat : WoWCloneTags::State_Uncombat;
+	AbilitySystemComponent->RemoveLooseGameplayTag(TagToRemove);
+	AbilitySystemComponent->AddLooseGameplayTag(TagToAdd);
+}
+
+void UCombatComponent::ApplyCombatStateMovementOverrides()
+{
+	if (UHeroLocomotionComponent* HeroLocomotionComponent = GetHeroLocomotionComponent())
+	{
+		HeroLocomotionComponent->ApplyCombatStateOverrides();
+	}
+}
+
+void UCombatComponent::RevertCombatStateMovementOverrides()
+{
+	if (UHeroLocomotionComponent* HeroLocomotionComponent = GetHeroLocomotionComponent())
+	{
+		HeroLocomotionComponent->RevertCombatStateOverrides();
+	}
+}
+
+void UCombatComponent::RefreshCombatExitTimer()
+{
+	UWorld* World = GetWorld();
+	if (!World || CombatExitDelaySeconds <= 0.0f)
+	{
+		return;
+	}
+
+	World->GetTimerManager().SetTimer(
+		CombatExitTimerHandle,
+		this,
+		&UCombatComponent::HandleCombatExitTimeout,
+		CombatExitDelaySeconds,
+		false);
+}
+
+void UCombatComponent::HandleCombatExitTimeout()
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(CombatExitTimerHandle);
+	}
+
+	if (!bIsInCombat)
+	{
+		return;
+	}
+
+	bIsInCombat = false;
+
+	if (UAbilitySystemComponent* AbilitySystemComponent = OwnerCharacter ? OwnerCharacter->GetAbilitySystemComponent() : nullptr)
+	{
+		ExitCombatState(AbilitySystemComponent);
+	}
+}
+
+bool UCombatComponent::HasInterruptibleAbilityCast() const
+{
+	return ActiveAbilityCast.IsActive() && !ActiveAbilityCast.bHasCommitted;
+}
+
+void UCombatComponent::BroadcastAbilityCastState()
+{
+	OnAbilityCastStateChanged.Broadcast(GetAbilityCastState());
+}
+
+void UCombatComponent::ClearAbilityCastState(bool bBroadcastStateChanged)
+{
+	if (!ActiveAbilityCast.IsActive() && !ActiveAbilityCast.bHasCommitted)
+	{
+		return;
+	}
+
+	SetAbilityCastingTag(false);
+	ActiveAbilityCast.Reset();
+
+	if (bBroadcastStateChanged)
+	{
+		BroadcastAbilityCastState();
+	}
+}
+
+void UCombatComponent::SetAbilityCastingTag(bool bEnable) const
+{
+	UAbilitySystemComponent* AbilitySystemComponent = OwnerCharacter ? OwnerCharacter->GetAbilitySystemComponent() : nullptr;
+	if (!AbilitySystemComponent)
+	{
+		return;
+	}
+
+	if (bEnable)
+	{
+		AbilitySystemComponent->AddLooseGameplayTag(WoWCloneTags::State_Casting);
+		return;
+	}
+
+	AbilitySystemComponent->RemoveLooseGameplayTag(WoWCloneTags::State_Casting);
+}
+
+void UCombatComponent::InterruptAbilityCast(float BlendOutTime, const TCHAR* DebugReason)
+{
+	if (!ActiveAbilityCast.IsActive())
+	{
+		return;
+	}
+
+	UE_LOG(LogCombatSystem, Log, TEXT("Ability cast interrupted by %s."), DebugReason ? DebugReason : TEXT("unknown reason"));
+
+	if (UBaseGameplayAbility* BaseAbility = Cast<UBaseGameplayAbility>(ActiveAbilityCast.SourceAbility.Get()))
+	{
+		BaseAbility->HandlePreCommitCancellation();
+	}
+
+	if (UAnimInstance* AnimInstance = GetAnimInstance())
+	{
+		AnimInstance->Montage_Stop(FMath::Max(0.0f, BlendOutTime), ActiveAbilityCast.Config.CastMontage);
+	}
+
+	ClearAbilityCastState(true);
+}

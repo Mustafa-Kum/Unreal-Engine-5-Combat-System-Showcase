@@ -6,6 +6,22 @@
 #include "GameplayEffectTypes.h"
 #include "WoWCloneGameplayTags.h"
 
+namespace
+{
+	void RemoveLooseGameplayTagCompletely(UAbilitySystemComponent* ASC, const FGameplayTag& Tag)
+	{
+		if (!ASC || !Tag.IsValid())
+		{
+			return;
+		}
+
+		while (ASC->HasMatchingGameplayTag(Tag))
+		{
+			ASC->RemoveLooseGameplayTag(Tag);
+		}
+	}
+}
+
 UHeroLocomotionComponent::UHeroLocomotionComponent()
 {
 	// Locomotion owns its own state updates so the character does not need a proxy tick.
@@ -15,6 +31,8 @@ UHeroLocomotionComponent::UHeroLocomotionComponent()
 	bWasMoving = false;
 	bIsWalking = false;
 	bWasWalking = false;
+	bHasAppliedLocomotionTags = false;
+	bRestoreWalkingAfterCombatOverride = false;
 }
 
 void UHeroLocomotionComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -36,6 +54,8 @@ void UHeroLocomotionComponent::InitializeLocomotion(ACharacterBase* InOwnerChara
 	UnbindMovementSpeedAttribute();
 	OwnerCharacter = InOwnerCharacter;
 	ASC = OwnerCharacter->GetAbilitySystemComponent();
+	bHasAppliedLocomotionTags = false;
+	bRestoreWalkingAfterCombatOverride = false;
 
 	SetupMovementComponent();
 	BindMovementSpeedAttribute();
@@ -132,6 +152,8 @@ void UHeroLocomotionComponent::ApplyCombatStateOverrides()
 {
 	if (!OwnerCharacter) return;
 
+	bRestoreWalkingAfterCombatOverride = bIsWalking;
+
 	if (bIsWalking)
 	{
 		SetWalkingState(false);
@@ -143,7 +165,12 @@ void UHeroLocomotionComponent::RevertCombatStateOverrides()
 	// AAA Symmetry: Mirror of ApplyCombatStateOverrides — restores movement to default run state on combat exit
 	if (!OwnerCharacter) return;
 
-	SetWalkingState(false);
+	if (bRestoreWalkingAfterCombatOverride)
+	{
+		SetWalkingState(true);
+	}
+
+	bRestoreWalkingAfterCombatOverride = false;
 }
 
 void UHeroLocomotionComponent::SetWalkingState(bool bEnabled)
@@ -210,15 +237,35 @@ bool UHeroLocomotionComponent::IsMoving() const
 
 bool UHeroLocomotionComponent::HasLocomotionStateChanged(bool bIsMovingState) const
 {
-	return bIsMovingState != bWasMoving || (bIsMovingState && bIsWalking != bWasWalking);
+	if (!bHasAppliedLocomotionTags)
+	{
+		return true;
+	}
+
+	if (bIsMovingState != bWasMoving || (bIsMovingState && bIsWalking != bWasWalking))
+	{
+		return true;
+	}
+
+	if (!ASC)
+	{
+		return false;
+	}
+
+	const FGameplayTag& ExpectedTag = !bIsMovingState
+		? WoWCloneTags::State_Idle
+		: (bIsWalking ? WoWCloneTags::State_Walking : WoWCloneTags::State_Running);
+
+	return !ASC->HasMatchingGameplayTag(ExpectedTag);
 }
 
 void UHeroLocomotionComponent::ClearLocomotionTags()
 {
 	if (!ASC) return;
-	ASC->RemoveLooseGameplayTag(WoWCloneTags::State_Idle);
-	ASC->RemoveLooseGameplayTag(WoWCloneTags::State_Walking);
-	ASC->RemoveLooseGameplayTag(WoWCloneTags::State_Running);
+
+	RemoveLooseGameplayTagCompletely(ASC, WoWCloneTags::State_Idle);
+	RemoveLooseGameplayTagCompletely(ASC, WoWCloneTags::State_Walking);
+	RemoveLooseGameplayTagCompletely(ASC, WoWCloneTags::State_Running);
 }
 
 void UHeroLocomotionComponent::ApplyCurrentLocomotionTag(bool bIsMovingState)
@@ -236,4 +283,5 @@ void UHeroLocomotionComponent::UpdateLocomotionStateCache(bool bIsMovingState)
 {
 	bWasMoving = bIsMovingState;
 	bWasWalking = bIsWalking;
+	bHasAppliedLocomotionTags = true;
 }

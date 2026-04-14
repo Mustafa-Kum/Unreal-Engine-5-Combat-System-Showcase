@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
 #include "GameplayEffectTypes.h"
+#include "TimerManager.h"
 #include "PlayerVitalsWidget.generated.h"
 
 class UProgressBar;
@@ -26,7 +27,9 @@ public:
 protected:
 	virtual void NativeConstruct() override;
 	virtual void NativeDestruct() override;
-	virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
+	void RefreshScheduledUpdateState();
+	virtual bool HasAdditionalScheduledWork() const;
+	virtual void ProcessAdditionalScheduledWork(float DeltaTime);
 
 	// --- BindWidget: Must match names in Widget Blueprint ---
 	UPROPERTY(meta = (BindWidgetOptional))
@@ -73,7 +76,7 @@ private:
 	void ExecuteBarInterpolation(class UProgressBar* TargetBar, float TargetPercent, float InterpSpeed, float DeltaTime);
 
 	// --- VITAL UPDATE ORCHESTRATION ---
-	void RefreshVitalDisplay(const struct FGameplayAttribute& CurrentAttr, const struct FGameplayAttribute& MaxAttr, float& InOutTargetPercent, float& InOutTrailingTimer, class UProgressBar* TrailingBar, class UTextBlock* ValueText);
+	void RefreshVitalDisplay(const struct FGameplayAttribute& CurrentAttr, const struct FGameplayAttribute& MaxAttr, float& InOutTargetPercent, float& InOutTrailingTimer, float& InOutPendingTrailingRaiseTarget, class UProgressBar* TrailingBar, class UTextBlock* ValueText);
 
 	// High Level Dispatchers (SRP)
 	void UpdateHealthDisplay();
@@ -82,12 +85,15 @@ private:
 	// Data Processing Helpers
 	[[nodiscard]] float FetchAttributeValue(const struct FGameplayAttribute& Attribute) const;
 	[[nodiscard]] float CalculateTargetPercent(float CurrentValue, float MaxValue) const;
-	void UpdateTrailingState(float NewTargetPercent, float& InOutTargetPercent, float& InOutTrailingTimer, class UProgressBar* TrailingBar);
+	void UpdateTrailingState(float NewTargetPercent, float& InOutTargetPercent, float& InOutTrailingTimer, float& InOutPendingTrailingRaiseTarget, class UProgressBar* TrailingBar);
 	void ExecuteVitalTextUpdate(class UTextBlock* TextBlock, float CurrentValue, float MaxValue);
 
 	// DRY: Pure formatting helper
 	[[nodiscard]] static FString FormatVitalText(float Current, float Max);
 	[[nodiscard]] bool HasActiveInterpolation() const;
+	void HandleScheduledUpdate();
+	void StartScheduledUpdates();
+	void StopScheduledUpdates();
 
 	// --- Internal State ---
 	UPROPERTY(Transient)
@@ -95,7 +101,14 @@ private:
 
 	float TargetHealthPercent = 1.0f;
 	float TargetManaPercent = 1.0f;
+	float PendingTrailingHealthRaiseTarget = 1.0f;
+	float PendingTrailingManaRaiseTarget = 1.0f;
 	
 	float TrailingHealthTimer = 0.0f;
 	float TrailingManaTimer = 0.0f;
+	FTimerHandle ScheduledUpdateTimerHandle;
+	FDelegateHandle HealthChangedHandle;
+	FDelegateHandle MaxHealthChangedHandle;
+	FDelegateHandle ManaChangedHandle;
+	FDelegateHandle MaxManaChangedHandle;
 };

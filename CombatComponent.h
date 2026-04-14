@@ -1,135 +1,115 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "CombatTypes.h"
 #include "Components/ActorComponent.h"
-#include "DataAssets/WeaponDataAsset.h"
-#include "Engine/DamageEvents.h"
-#include "Engine/EngineTypes.h"
-#include "Engine/World.h"
 #include "TimerManager.h"
-#include "UObject/ObjectKey.h"
 #include "CombatComponent.generated.h"
 
+class UAnimInstance;
 class UAnimMontage;
+class UAnimNotify;
 class UAnimNotifyState;
-class UPrimitiveComponent;
+class UGameplayAbility;
+class UWeaponDataAsset;
+struct FCombatComboData;
+struct FGameplayTagContainer;
 
-struct FWoWCloneCombatDamageEvent : public FDamageEvent
-{
-	static const int32 ClassID = 0x57A9D114;
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnAbilityCastStateChanged, const FAbilityCastState&, CastState);
 
-	bool bIsCriticalHit = false;
-
-	FWoWCloneCombatDamageEvent()
-		: FDamageEvent(UDamageType::StaticClass())
-	{
-	}
-
-	explicit FWoWCloneCombatDamageEvent(bool bInIsCriticalHit)
-		: FDamageEvent(UDamageType::StaticClass())
-		, bIsCriticalHit(bInIsCriticalHit)
-	{
-	}
-
-	virtual int32 GetTypeID() const override
-	{
-		return FWoWCloneCombatDamageEvent::ClassID;
-	}
-
-	virtual bool IsOfType(int32 InID) const override
-	{
-		return InID == FWoWCloneCombatDamageEvent::ClassID || FDamageEvent::IsOfType(InID);
-	}
-};
-
-/**
- * AAA Combat Component: Manages combo state and montage execution.
- * Optimized with component caching and orchestration for high performance.
- */
-UCLASS( ClassGroup=(Custom), meta=(BlueprintSpawnableComponent) )
+UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
 class WOWCLONE_API UCombatComponent : public UActorComponent
 {
 	GENERATED_BODY()
 
-public:	
+public:
 	UCombatComponent();
 
 protected:
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
-	virtual void TickComponent(float DeltaTime, enum ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
 public:
-	/** --- COMBAT INTERFACE --- */
-	
-	/** Main entry point for attack input - Orchestration Layer */
-	UFUNCTION(BlueprintCallable, Category = "Combat")
-	void ProcessAttack();
+	void InitializeCombatState();
+	void NotifyDamageDealt();
+	[[nodiscard]] bool IsInCombat() const { return bIsInCombat; }
 
-	/** Called by AnimNotifies to open/close the combo window */
 	UFUNCTION(BlueprintCallable, Category = "Combat")
-	void SetCanAdvanceCombo(bool bInCanAdvance);
+	void ProcessAttackInput(ECombatAttackType AttackType);
 
-	/** Called by attack notify states to register the active movement interrupt window */
+	void BeginComboWindow(const UAnimNotifyState* WindowSource, const FComboWindowRequest& ComboWindowRequest = FComboWindowRequest());
+	void EndComboWindow(const UAnimNotifyState* WindowSource);
+
 	void BeginAttackMoveInterruptWindow(const UAnimNotifyState* WindowSource, const UAnimMontage* AttackMontage, float InBlendOutTime);
-
-	/** Called by attack notify states to unregister the active movement interrupt window */
 	void EndAttackMoveInterruptWindow(const UAnimNotifyState* WindowSource);
-
-	/** Called by attack notify states to register the active melee hit window */
-	void BeginMeleeHitWindow(const UAnimNotifyState* WindowSource, const UAnimMontage* AttackMontage);
-
-	/** Called by attack notify states to unregister the active melee hit window */
+	void BeginAbilityInterruptWindow(const UAnimNotifyState* WindowSource, const UAnimMontage* AttackMontage, float InBlendOutTime);
+	void EndAbilityInterruptWindow(const UAnimNotifyState* WindowSource);
+	void BeginMeleeHitWindow(const UAnimNotifyState* WindowSource, const UAnimMontage* AttackMontage, const FMeleeHitWindowRequest& HitWindowRequest = FMeleeHitWindowRequest());
 	void EndMeleeHitWindow(const UAnimNotifyState* WindowSource);
 
-	/** Resets the combo to the first attack */
 	void ResetCombo();
-
-	/** Stops the active attack montage if movement-cancel is currently allowed */
 	bool TryInterruptAttackForMovement();
+	bool TryBeginAbilityAreaImpact(const FAbilityAreaImpactConfig& AreaImpactConfig, UGameplayAbility* SourceAbility);
+	bool CanActivateAbilityAreaImpact(const FAbilityAreaImpactConfig& AreaImpactConfig, FGameplayTagContainer* OptionalRelevantTags = nullptr) const;
+	void EndAbilityAreaImpact(UGameplayAbility* SourceAbility);
+	void TriggerAbilityAreaImpact(const UAnimMontage* SourceMontage);
+	bool TryBeginAbilityCast(const FAbilityCastConfig& CastConfig, UGameplayAbility* SourceAbility, FGameplayTagContainer* OptionalRelevantTags = nullptr);
+	void EndAbilityCast(UGameplayAbility* SourceAbility);
+	bool NotifyAbilityCastCommit(const UAnimMontage* SourceMontage, TSubclassOf<UAnimNotify> NotifyClass);
+	void HandleReceivedDamage(float AppliedDamage);
+
+	UFUNCTION(BlueprintCallable, Category = "Combat|Cast")
+	[[nodiscard]] FAbilityCastState GetAbilityCastState() const;
+
+	UPROPERTY(BlueprintAssignable, Category = "Combat|Cast")
+	FOnAbilityCastStateChanged OnAbilityCastStateChanged;
 
 protected:
-	/** --- STATE TRACKING --- */
-	
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Combat|State")
 	int32 CurrentComboIndex = 0;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Combat|State")
 	bool bCanAdvanceCombo = false;
 
-	/** --- AAA ORCHESTRATION --- */
-	
 	[[nodiscard]] bool CanPerformAttack() const;
-	void HandleComboInput();
-	void HandleInitialInput();
-	void ExecuteNextComboStep();
+	[[nodiscard]] bool CanAdvanceComboForAttackType(ECombatAttackType AttackType) const;
+	void HandleComboInput(ECombatAttackType AttackType);
+	void HandleInitialInput(ECombatAttackType AttackType);
+	void ExecuteNextComboStep(ECombatAttackType AttackType);
 	void ClearPendingComboRequest();
-	void BufferAttackInput();
+	void SchedulePendingComboRetry();
+	void RetryPendingComboRequest();
+	void BufferAttackInput(ECombatAttackType AttackType);
 	void ConsumeBufferedAttackInput();
 	void ClearBufferedAttackInput();
 	[[nodiscard]] bool HasBufferedAttackInput() const;
 
-	[[nodiscard]] bool IsComboStateValid(const class UWeaponDataAsset* WeaponData) const;
-	void AdvanceComboState(const class UWeaponDataAsset* WeaponData);
+	[[nodiscard]] bool IsComboStateValid(const FCombatComboData* ComboData) const;
+	void AdvanceComboState(const FCombatComboData& ComboData, ECombatAttackType AttackType);
+	[[nodiscard]] int32 GetComboIndexForAttackType(ECombatAttackType AttackType) const;
+	int32& GetMutableComboIndexForAttackType(ECombatAttackType AttackType);
+	void RefreshCurrentComboIndex(ECombatAttackType AttackType);
+	void ResetComboState(ECombatAttackType AttackType);
 
-	void PlayComboAttack(class UWeaponDataAsset* WeaponData, int32 Index);
-	void RequestComboMontageLoad(class UWeaponDataAsset* WeaponData, int32 Index);
-	void OnComboMontageLoaded(class UWeaponDataAsset* WeaponData, int32 Index);
-	
-	/** --- PERFORMANCE UTILS & CACHING --- */
-	[[nodiscard]] class UWeaponDataAsset* GetEquippedWeaponData() const;
-	[[nodiscard]] class UInventoryComponent* GetInventoryComponent() const;
-	[[nodiscard]] class UAnimInstance* GetAnimInstance() const;
+	void PlayComboAttack(UWeaponDataAsset* WeaponData, ECombatAttackType AttackType, int32 Index);
+	void RequestComboMontageLoad(UWeaponDataAsset* WeaponData, ECombatAttackType AttackType, int32 Index);
+	void OnComboMontageLoaded(UWeaponDataAsset* WeaponData, ECombatAttackType AttackType, int32 Index);
+	[[nodiscard]] FMeleeKnockbackConfig GetComboStepKnockbackConfig(const FCombatComboData* ComboData, int32 Index) const;
+
+	[[nodiscard]] UWeaponDataAsset* GetEquippedWeaponData() const;
+	[[nodiscard]] const FCombatComboData* GetComboDataForAttackType(const UWeaponDataAsset* WeaponData, ECombatAttackType AttackType) const;
+	[[nodiscard]] class UEquipmentComponent* GetEquipmentComponent() const;
+	[[nodiscard]] class UCombatImpactComponent* GetCombatImpactComponent() const;
+	[[nodiscard]] class UWeaponActionComponent* GetWeaponActionComponent() const;
+	[[nodiscard]] class UHeroLocomotionComponent* GetHeroLocomotionComponent() const;
+	[[nodiscard]] UAnimInstance* GetAnimInstance() const;
 
 private:
-	UFUNCTION()
-	void HandleWeaponHitOverlap(
-		UPrimitiveComponent* OverlappedComponent,
-		AActor* OtherActor,
-		UPrimitiveComponent* OtherComp,
-		int32 OtherBodyIndex,
-		bool bFromSweep,
-		const FHitResult& SweepResult);
+	struct FComboWindowRuntimeState
+	{
+		FComboWindowRequest Request;
+		int32 ActiveCount = 0;
+	};
 
 	struct FAttackInterruptWindowState
 	{
@@ -138,78 +118,79 @@ private:
 		int32 ActiveCount = 0;
 	};
 
-	struct FMeleeHitWindowState
+	struct FAbilityCastRuntimeState
 	{
-		const UAnimMontage* Montage = nullptr;
-		int32 ActiveCount = 0;
+		FAbilityCastConfig Config;
+		TWeakObjectPtr<UGameplayAbility> SourceAbility;
+		FText AbilityName;
+		float StartWorldTime = 0.0f;
+		bool bHasCommitted = false;
+
+		[[nodiscard]] bool IsActive() const;
+		void Reset();
 	};
 
-	struct FHitStopActorState
-	{
-		TWeakObjectPtr<AActor> Actor;
-		float PreviousCustomTimeDilation = 1.0f;
-	};
-
-	void RecordPlayedAttackMontage(UAnimMontage* PlayedMontage, float PlayedDuration);
+	bool TryPrepareAbilityAreaImpactActivation(UAnimInstance* AnimInstance);
+	void BeginInterruptWindow(TMap<const UAnimNotifyState*, FAttackInterruptWindowState>& WindowStates, const UAnimNotifyState* WindowSource, const UAnimMontage* AttackMontage, float InBlendOutTime);
+	void EndInterruptWindow(TMap<const UAnimNotifyState*, FAttackInterruptWindowState>& WindowStates, const UAnimNotifyState* WindowSource);
+	void InterruptAttackMontage(UAnimInstance* AnimInstance, const UAnimMontage* AttackMontage, float BlendOutTime);
+	void RecordPlayedAttackMontage(UAnimMontage* PlayedMontage, float PlayedDuration, const FMeleeKnockbackConfig& KnockbackConfig);
 	void OnAttackMontageBlendingOut(UAnimMontage* AttackMontage, bool bInterrupted);
-	void ClearAttackInterruptWindowsForMontage(const UAnimMontage* AttackMontage);
-	void ClearMeleeHitWindowsForMontage(const UAnimMontage* AttackMontage);
-	void RefreshWeaponHitCollisionState();
-	void TraceReliableMeleeHits();
-	void ResetReliableMeleeTraceState();
-	[[nodiscard]] bool CanRegisterMeleeHit(AActor* OtherActor) const;
-	[[nodiscard]] float ResolveOutgoingMeleeDamage(bool& bOutIsCriticalHit) const;
-	[[nodiscard]] bool RollCriticalHit() const;
-	[[nodiscard]] FVector ResolveMeleeTraceOrigin() const;
-	[[nodiscard]] float ResolveMeleeTraceRadius() const;
-	void ApplyMeleeHitToActor(AActor* HitActor);
-	void TryPlayHitCameraShake() const;
-	void TryApplyHitStop(AActor* HitActor);
-	void RestoreHitStop(int32 HitStopRequestId);
-	void RestoreActiveHitStop();
-	[[nodiscard]] const UAnimMontage* ResolveInterruptibleAttackMontage(UAnimInstance* AnimInstance) const;
-	[[nodiscard]] float ResolveInterruptBlendOutTime(const UAnimMontage* AttackMontage) const;
+	void RefreshComboWindowState();
+	void ClearInterruptWindowsForMontage(TMap<const UAnimNotifyState*, FAttackInterruptWindowState>& WindowStates, const UAnimMontage* AttackMontage);
+	[[nodiscard]] const UAnimMontage* ResolveInterruptibleMontage(UAnimInstance* AnimInstance, const TMap<const UAnimNotifyState*, FAttackInterruptWindowState>& WindowStates) const;
+	[[nodiscard]] float ResolveInterruptBlendOutTime(const UAnimMontage* AttackMontage, const TMap<const UAnimNotifyState*, FAttackInterruptWindowState>& WindowStates) const;
+	void EnterCombatState(class UAbilitySystemComponent* AbilitySystemComponent);
+	void ExitCombatState(class UAbilitySystemComponent* AbilitySystemComponent);
+	void HandleCombatTagChange(class UAbilitySystemComponent* AbilitySystemComponent, bool bEnteringCombat);
+	void ApplyCombatStateMovementOverrides();
+	void RevertCombatStateMovementOverrides();
+	void RefreshCombatExitTimer();
+	void HandleCombatExitTimeout();
+	[[nodiscard]] bool HasInterruptibleAbilityCast() const;
+	void BroadcastAbilityCastState();
+	void ClearAbilityCastState(bool bBroadcastStateChanged);
+	void SetAbilityCastingTag(bool bEnable) const;
+	void InterruptAbilityCast(float BlendOutTime, const TCHAR* DebugReason);
 
 	UPROPERTY(Transient)
 	TObjectPtr<class ACharacterBase> OwnerCharacter;
 
 	UPROPERTY(Transient)
-	TWeakObjectPtr<class UWeaponDataAsset> PendingComboWeaponData;
+	TWeakObjectPtr<UWeaponDataAsset> PendingComboWeaponData;
 
 	UPROPERTY(Transient)
 	TWeakObjectPtr<UAnimMontage> CurrentAttackMontage;
 
+	int32 LightComboIndex = 0;
+	int32 HeavyComboIndex = 0;
+	ECombatAttackType ActiveAttackType = ECombatAttackType::Light;
+	ECombatAttackType BufferedAttackType = ECombatAttackType::Light;
+	ECombatAttackType PendingComboAttackType = ECombatAttackType::Light;
 	int32 PendingComboMontageIndex = INDEX_NONE;
+	TMap<const UAnimNotifyState*, FComboWindowRuntimeState> ActiveComboWindows;
 	TMap<const UAnimNotifyState*, FAttackInterruptWindowState> ActiveAttackInterruptWindows;
-	TMap<const UAnimNotifyState*, FMeleeHitWindowState> ActiveMeleeHitWindows;
-	TSet<TObjectKey<AActor>> HitActorsInActiveMeleeWindow;
-	TArray<FHitStopActorState> ActiveHitStopActors;
-	FTimerHandle HitStopRestoreTimerHandle;
-	int32 ActiveHitStopRequestId = 0;
+	TMap<const UAnimNotifyState*, FAttackInterruptWindowState> ActiveAbilityInterruptWindows;
+	FTimerHandle PendingComboRetryTimerHandle;
+	FTimerHandle CombatExitTimerHandle;
 	bool bBufferedAttackInput = false;
+	bool bHasActiveAttackType = false;
+	bool bHasPendingComboRequest = false;
+	bool bCanAdvanceLightCombo = false;
+	bool bCanAdvanceHeavyCombo = false;
+	bool bIsInCombat = false;
 	float BufferedAttackInputExpiryTime = 0.0f;
-	bool bHasReliableTraceOrigin = false;
-	FVector PreviousReliableTraceOrigin = FVector::ZeroVector;
+	FAbilityCastRuntimeState ActiveAbilityCast;
 
 	UPROPERTY(EditDefaultsOnly, Category = "Combat|Input", meta = (ClampMin = "0.0"))
 	float AttackInputBufferDuration = 0.2f;
 
-	UPROPERTY(EditDefaultsOnly, Category = "Combat|Damage", meta = (ClampMin = "1.0"))
-	float CriticalDamageMultiplier = 2.0f;
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|State", meta = (ClampMin = "0.1"))
+	float CombatExitDelaySeconds = 5.0f;
 
-	UPROPERTY(EditDefaultsOnly, Category = "Combat|Hit Detection")
-	bool bEnableReliableMeleeTracing = true;
-
-	UPROPERTY(EditDefaultsOnly, Category = "Combat|Hit Detection", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-	float ReliableMeleeTraceRadiusScale = 0.35f;
-
-	UPROPERTY(EditDefaultsOnly, Category = "Combat|Hit Detection", meta = (ClampMin = "0.0"))
-	float ReliableMeleeTraceMinRadius = 8.0f;
-
-	UPROPERTY(EditDefaultsOnly, Category = "Combat|Hit Detection", meta = (ClampMin = "0.0"))
-	float ReliableMeleeTraceMaxRadius = 28.0f;
-
-	// AAA Performance: Cached references to avoid redundant FindComponentByClass lookups
-	mutable TWeakObjectPtr<class UInventoryComponent> CachedInventory;
-	mutable TWeakObjectPtr<class UAnimInstance> CachedAnimInstance;
+	mutable TWeakObjectPtr<class UEquipmentComponent> CachedEquipment;
+	mutable TWeakObjectPtr<class UCombatImpactComponent> CachedCombatImpact;
+	mutable TWeakObjectPtr<class UWeaponActionComponent> CachedWeaponAction;
+	mutable TWeakObjectPtr<class UHeroLocomotionComponent> CachedHeroLocomotion;
+	mutable TWeakObjectPtr<UAnimInstance> CachedAnimInstance;
 };

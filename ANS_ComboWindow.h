@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Animation/AnimNotifies/AnimNotifyState.h"
+#include "CombatTypes.h"
 #include "ANS_ComboWindow.generated.h"
 
 /**
@@ -13,6 +14,9 @@ class WOWCLONE_API UANS_ComboWindow : public UAnimNotifyState
 	GENERATED_BODY()
 
 public:
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combo Window")
+	FComboWindowRequest ComboWindowRequest;
+
 	virtual void NotifyBegin(USkeletalMeshComponent* MeshComp, UAnimSequenceBase* Animation, float TotalDuration) override;
 	virtual void NotifyEnd(USkeletalMeshComponent* MeshComp, UAnimSequenceBase* Animation) override;
 };

@@ -1,11 +1,8 @@
 #include "Characters/DummyTargetCharacter.h"
-#include "Abilities/AttributeSets/CharacterAttributeSet.h"
-#include "AbilitySystemComponent.h"
 #include "Components/CapsuleComponent.h"
+#include "Components/DamageReceiverComponent.h"
 #include "Components/WidgetComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
-
-DEFINE_LOG_CATEGORY_STATIC(LogDummyTargetCharacter, Log, All);
 
 ADummyTargetCharacter::ADummyTargetCharacter()
 {
@@ -39,37 +36,9 @@ void ADummyTargetCharacter::BeginPlay()
 {
 	Super::BeginPlay();
 
-	if (UAbilitySystemComponent* ASC = GetAbilitySystemComponent())
+	if (UDamageReceiverComponent* DamageReceiverComponent = FindComponentByClass<UDamageReceiverComponent>())
 	{
-		ASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetHealthAttribute()).AddUObject(this, &ADummyTargetCharacter::OnHealthChanged);
-	}
-}
-
-void ADummyTargetCharacter::EndPlay(const EEndPlayReason::Type EndPlayReason)
-{
-	if (UAbilitySystemComponent* ASC = GetAbilitySystemComponent())
-	{
-		ASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetHealthAttribute()).RemoveAll(this);
-	}
-
-	Super::EndPlay(EndPlayReason);
-}
-
-void ADummyTargetCharacter::OnHealthChanged(const FOnAttributeChangeData& Data)
-{
-	UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
-	if (!ASC)
-	{
-		return;
-	}
-
-	const float MaxHealth = ASC->GetNumericAttribute(UCharacterAttributeSet::GetMaxHealthAttribute());
-
-	UE_LOG(LogDummyTargetCharacter, Log, TEXT("%s Health: %.2f / %.2f"), *GetName(), Data.NewValue, MaxHealth);
-
-	if (Data.NewValue <= 0.0f)
-	{
-		ASC->SetNumericAttributeBase(UCharacterAttributeSet::GetHealthAttribute(), MaxHealth);
+		DamageReceiverComponent->SetRestoreHealthToMaxOnDefeat(true);
 	}
 }
 

@@ -61,6 +61,8 @@ private:
 	uint8 bWasMoving : 1;
 	uint8 bIsWalking : 1;
 	uint8 bWasWalking : 1;
+	uint8 bHasAppliedLocomotionTags : 1;
+	uint8 bRestoreWalkingAfterCombatOverride : 1;
 
 	UPROPERTY(EditDefaultsOnly, Category = "Movement Settings")
 	float DefaultMaxWalkSpeed = 600.0f;

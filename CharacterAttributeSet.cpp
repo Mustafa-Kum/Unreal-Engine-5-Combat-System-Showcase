@@ -1,7 +1,10 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 
 #include "Abilities/AttributeSets/CharacterAttributeSet.h"
+#include "DataAssets/CharacterDataAsset.h"
 #include "GameplayEffectExtension.h"
+
+DEFINE_LOG_CATEGORY_STATIC(LogCharacterAttributeSet, Log, All);
 
 UCharacterAttributeSet::UCharacterAttributeSet()
 {
@@ -10,67 +13,267 @@ UCharacterAttributeSet::UCharacterAttributeSet()
 	// a Gameplay Effect or an Initialization function during Character Setup.
 }
 
+FString UCharacterAttributeSet::GetFriendlyAttributeLabel(const FGameplayAttribute& Attribute)
+{
+	if (Attribute == GetStrengthAttribute()) return TEXT("Strength");
+	if (Attribute == GetAgilityAttribute()) return TEXT("Agility");
+	if (Attribute == GetIntellectAttribute()) return TEXT("Intellect");
+	if (Attribute == GetStaminaAttribute()) return TEXT("Stamina");
+	if (Attribute == GetCriticalStrikeChanceAttribute()) return TEXT("Critical Strike Chance");
+	if (Attribute == GetMovementSpeedAttribute()) return TEXT("Movement Speed");
+	if (Attribute == GetAttackDamageAttribute()) return TEXT("Attack Damage");
+	if (Attribute == GetSpellDamageAttribute()) return TEXT("Spell Damage");
+	if (Attribute == GetCastSpeedAttribute()) return TEXT("Cast Speed");
+	if (Attribute == GetArmorAttribute()) return TEXT("Armor");
+	if (Attribute == GetMagicResistanceAttribute()) return TEXT("Magic Resistance");
+	if (Attribute == GetManaAttribute()) return TEXT("Mana");
+	if (Attribute == GetManaRegenAttribute()) return TEXT("Mana Regen");
+	if (Attribute == GetHealthAttribute()) return TEXT("Health");
+	if (Attribute == GetHealthRegenAttribute()) return TEXT("Health Regen");
+	return Attribute.GetName();
+}
+
+bool UCharacterAttributeSet::IsPercentageDisplayAttribute(const FGameplayAttribute& Attribute)
+{
+	return Attribute == GetCriticalStrikeChanceAttribute()
+		|| Attribute == GetCastSpeedAttribute();
+}
+
+void UCharacterAttributeSet::InitializeStartingStats(const FCharacterStartingStats& Stats)
+{
+	bIsInitializingStartingStats = true;
+
+	BaseHealthFromScaling = Stats.DerivedScaling.BaseHealth;
+	AttackDamagePerStrength = Stats.DerivedScaling.AttackDamagePerStrength;
+	ArmorPerAgility = Stats.DerivedScaling.ArmorPerAgility;
+	CastSpeedPercentPerAgility = Stats.DerivedScaling.CastSpeedPercentPerAgility;
+	MaxCastSpeedPercent = Stats.DerivedScaling.MaxCastSpeedPercent;
+	SpellDamagePerIntellect = Stats.DerivedScaling.SpellDamagePerIntellect;
+	MaxManaPerIntellect = Stats.DerivedScaling.MaxManaPerIntellect;
+	MaxHealthPerStamina = Stats.DerivedScaling.MaxHealthPerStamina;
+	BaseHealthRegen = Stats.DerivedScaling.BaseHealthRegen;
+	HealthRegenPerStrength = Stats.DerivedScaling.HealthRegenPerStrength;
+	BaseManaRegen = Stats.DerivedScaling.BaseManaRegen;
+	ManaRegenPerIntellect = Stats.DerivedScaling.ManaRegenPerIntellect;
+
+	const float InitialArmor = Stats.BaseArmor + (Stats.InitialAgility * ArmorPerAgility);
+	const float InitialCastSpeed = Stats.InitialAgility * CastSpeedPercentPerAgility;
+	const float InitialAttackDamage = Stats.BasePhysicalDamage + (Stats.InitialStrength * AttackDamagePerStrength);
+	const float InitialSpellDamage = Stats.BaseMagicDamage + (Stats.InitialIntellect * SpellDamagePerIntellect);
+	const float FinalMaxHealth = BaseHealthFromScaling + (Stats.InitialStamina * MaxHealthPerStamina);
+	const float FinalMaxMana = Stats.BaseMaxMana + (Stats.InitialIntellect * MaxManaPerIntellect);
+	const float InitialHealthRegen = BaseHealthRegen + (Stats.InitialStrength * HealthRegenPerStrength);
+	const float InitialManaRegen = BaseManaRegen + (Stats.InitialIntellect * ManaRegenPerIntellect);
+
+	if (UAbilitySystemComponent* ASC = GetOwningAbilitySystemComponent())
+	{
+		ASC->SetNumericAttributeBase(GetStrengthAttribute(), Stats.InitialStrength);
+		ASC->SetNumericAttributeBase(GetAgilityAttribute(), Stats.InitialAgility);
+		ASC->SetNumericAttributeBase(GetIntellectAttribute(), Stats.InitialIntellect);
+		ASC->SetNumericAttributeBase(GetStaminaAttribute(), Stats.InitialStamina);
+		ASC->SetNumericAttributeBase(GetCriticalStrikeChanceAttribute(), Stats.BaseCriticalStrikeChance);
+		ASC->SetNumericAttributeBase(GetMovementSpeedAttribute(), Stats.BaseMovementSpeed);
+		ASC->SetNumericAttributeBase(GetArmorAttribute(), InitialArmor);
+		ASC->SetNumericAttributeBase(GetMagicResistanceAttribute(), Stats.BaseMagicResistance);
+		ASC->SetNumericAttributeBase(GetCastSpeedAttribute(), InitialCastSpeed);
+		ASC->SetNumericAttributeBase(GetAttackDamageAttribute(), InitialAttackDamage);
+		ASC->SetNumericAttributeBase(GetSpellDamageAttribute(), InitialSpellDamage);
+		ASC->SetNumericAttributeBase(GetMaxHealthAttribute(), FinalMaxHealth);
+		ASC->SetNumericAttributeBase(GetHealthAttribute(), FinalMaxHealth);
+		ASC->SetNumericAttributeBase(GetMaxManaAttribute(), FinalMaxMana);
+		ASC->SetNumericAttributeBase(GetManaAttribute(), FinalMaxMana);
+		ASC->SetNumericAttributeBase(GetHealthRegenAttribute(), InitialHealthRegen);
+		ASC->SetNumericAttributeBase(GetManaRegenAttribute(), InitialManaRegen);
+		UE_LOG(
+			LogCharacterAttributeSet,
+			Log,
+			TEXT("InitializeStartingStats -> Strength=%.2f Agility=%.2f Intellect=%.2f Stamina=%.2f AttackDamage=%.2f SpellDamage=%.2f Armor=%.2f CastSpeed=%.2f HealthRegen=%.2f ManaRegen=%.2f"),
+			ASC->GetNumericAttribute(GetStrengthAttribute()),
+			ASC->GetNumericAttribute(GetAgilityAttribute()),
+			ASC->GetNumericAttribute(GetIntellectAttribute()),
+			ASC->GetNumericAttribute(GetStaminaAttribute()),
+			ASC->GetNumericAttribute(GetAttackDamageAttribute()),
+			ASC->GetNumericAttribute(GetSpellDamageAttribute()),
+			ASC->GetNumericAttribute(GetArmorAttribute()),
+			ASC->GetNumericAttribute(GetCastSpeedAttribute()),
+			ASC->GetNumericAttribute(GetHealthRegenAttribute()),
+			ASC->GetNumericAttribute(GetManaRegenAttribute()));
+		bIsInitializingStartingStats = false;
+		return;
+	}
+
+	InitStrength(Stats.InitialStrength);
+	InitAgility(Stats.InitialAgility);
+	InitIntellect(Stats.InitialIntellect);
+	InitStamina(Stats.InitialStamina);
+
+	InitCriticalStrikeChance(Stats.BaseCriticalStrikeChance);
+	InitMovementSpeed(Stats.BaseMovementSpeed);
+	InitArmor(InitialArmor);
+	InitMagicResistance(Stats.BaseMagicResistance);
+	InitCastSpeed(InitialCastSpeed);
+	InitAttackDamage(InitialAttackDamage);
+	InitSpellDamage(InitialSpellDamage);
+	InitMaxHealth(FinalMaxHealth);
+	InitHealth(FinalMaxHealth);
+	InitMaxMana(FinalMaxMana);
+	InitMana(FinalMaxMana);
+	InitHealthRegen(InitialHealthRegen);
+	InitManaRegen(InitialManaRegen);
+
+	bIsInitializingStartingStats = false;
+}
+
 void UCharacterAttributeSet::PreAttributeChange(const FGameplayAttribute& Attribute, float& NewValue)
 {
 	Super::PreAttributeChange(Attribute, NewValue);
 
-	if (HandleDerivedAttributeChange(Attribute, NewValue))
+	HandleClampedAttributeChange(Attribute, NewValue);
+}
+
+void UCharacterAttributeSet::PreAttributeBaseChange(const FGameplayAttribute& Attribute, float& NewValue) const
+{
+	Super::PreAttributeBaseChange(Attribute, NewValue);
+
+	HandleClampedAttributeChange(Attribute, NewValue);
+}
+
+void UCharacterAttributeSet::PostAttributeChange(const FGameplayAttribute& Attribute, float OldValue, float NewValue)
+{
+	Super::PostAttributeChange(Attribute, OldValue, NewValue);
+
+	if (bIsInitializingStartingStats)
 	{
 		return;
 	}
 
-	HandleClampedVitalChange(Attribute, NewValue);
+	if (Attribute == GetStrengthAttribute()
+		|| Attribute == GetAgilityAttribute()
+		|| Attribute == GetIntellectAttribute()
+		|| Attribute == GetStaminaAttribute())
+	{
+		UE_LOG(
+			LogCharacterAttributeSet,
+			Log,
+			TEXT("PostAttributeChange -> %s Old=%.2f New=%.2f"),
+			*Attribute.GetName(),
+			OldValue,
+			NewValue);
+
+		HandleDerivedAttributeChange(Attribute, OldValue, NewValue);
+	}
+}
+
+void UCharacterAttributeSet::PostAttributeBaseChange(const FGameplayAttribute& Attribute, float OldValue, float NewValue) const
+{
+	Super::PostAttributeBaseChange(Attribute, OldValue, NewValue);
+
+	if (bIsInitializingStartingStats)
+	{
+		return;
+	}
+
+	if (Attribute == GetStrengthAttribute()
+		|| Attribute == GetAttackDamageAttribute()
+		|| Attribute == GetSpellDamageAttribute()
+		|| Attribute == GetCastSpeedAttribute())
+	{
+		UE_LOG(
+			LogCharacterAttributeSet,
+			Log,
+			TEXT("PostAttributeBaseChange -> %s Old=%.2f New=%.2f CurrentAttackDamage=%.2f CurrentSpellDamage=%.2f CurrentCastSpeed=%.2f"),
+			*Attribute.GetName(),
+			OldValue,
+			NewValue,
+			GetOwningAbilitySystemComponent() ? GetOwningAbilitySystemComponent()->GetNumericAttribute(GetAttackDamageAttribute()) : GetAttackDamage(),
+			GetOwningAbilitySystemComponent() ? GetOwningAbilitySystemComponent()->GetNumericAttribute(GetSpellDamageAttribute()) : GetSpellDamage(),
+			GetOwningAbilitySystemComponent() ? GetOwningAbilitySystemComponent()->GetNumericAttribute(GetCastSpeedAttribute()) : GetCastSpeed());
+	}
 }
 
 // ==============================================================================
 // SOLID Helpers — Each stat scaling rule is isolated and self-documenting
 // ==============================================================================
 
-void UCharacterAttributeSet::RecalculateFromStrength(float NewStrength)
+void UCharacterAttributeSet::RecalculateFromStrength(float OldStrength, float NewStrength)
 {
-	// 1 Strength = 2.0 Physical Attack Damage
-	const float Diff = NewStrength - GetStrength();
-	SetAttackDamage(GetAttackDamage() + (Diff * 2.0f));
+	const float Diff = NewStrength - OldStrength;
+	ApplyAdditiveAttributeBaseDelta(GetAttackDamageAttribute(), Diff * AttackDamagePerStrength);
+	ApplyAdditiveAttributeBaseDelta(GetHealthRegenAttribute(), Diff * HealthRegenPerStrength);
+	UE_LOG(
+		LogCharacterAttributeSet,
+		Log,
+		TEXT("RecalculateFromStrength -> Old=%.2f New=%.2f Diff=%.2f AttackDamageBaseNow=%.2f HealthRegenBaseNow=%.2f"),
+		OldStrength,
+		NewStrength,
+		Diff,
+		GetAttributeBaseValue(GetAttackDamageAttribute()),
+		GetAttributeBaseValue(GetHealthRegenAttribute()));
 }
 
-void UCharacterAttributeSet::RecalculateFromAgility(float NewAgility)
+void UCharacterAttributeSet::RecalculateFromAgility(float OldAgility, float NewAgility)
 {
-	// 1 Agility = 0.01 Haste (1% faster attacks)
-	// Model: FinalInterval = WeaponBaseInterval / (1.0 + (Agility * 0.01))
-	SetCastSpeed(CalculateHastedInterval(GetWeaponBaseInterval(), NewAgility));
+	const float Diff = NewAgility - OldAgility;
+	ApplyAdditiveAttributeBaseDelta(GetArmorAttribute(), Diff * ArmorPerAgility);
+	ApplyAdditiveAttributeBaseDelta(GetCastSpeedAttribute(), Diff * CastSpeedPercentPerAgility);
 }
 
-void UCharacterAttributeSet::RecalculateFromWeaponInterval(float NewInterval)
+void UCharacterAttributeSet::RecalculateFromIntellect(float OldIntellect, float NewIntellect)
 {
-	// When equipping a new weapon, recalculate the final interval based on current Agility (Haste)
-	SetCastSpeed(CalculateHastedInterval(NewInterval, GetAgility()));
-}
+	const float Diff = NewIntellect - OldIntellect;
+	ApplyAdditiveAttributeBaseDelta(GetSpellDamageAttribute(), Diff * SpellDamagePerIntellect);
+	ApplyAdditiveAttributeBaseDelta(GetManaRegenAttribute(), Diff * ManaRegenPerIntellect);
 
-void UCharacterAttributeSet::RecalculateFromIntellect(float NewIntellect)
-{
-	// 1 Intellect = 2.5 Spell/Magic Damage
-	const float Diff = NewIntellect - GetIntellect();
-	SetSpellDamage(GetSpellDamage() + (Diff * 2.5f));
+	const float OldMaxMana = GetAttributeBaseValue(GetMaxManaAttribute());
+	const float NewMaxMana = OldMaxMana + (Diff * MaxManaPerIntellect);
+	SetAttributeBaseValue(GetMaxManaAttribute(), NewMaxMana);
 
-	// 1 Intellect = 15 Max Mana (WoW-style caster scaling)
-	const float OldMaxMana = GetMaxMana();
-	const float NewMaxMana = OldMaxMana + (Diff * 15.0f);
-	SetMaxMana(NewMaxMana);
-
-	// Proportional Mana Adjustment (AAA Standard: Maintains current % during buff/debuff)
 	AdjustAttributeProportionally(GetManaAttribute(), NewMaxMana, OldMaxMana);
 }
 
-void UCharacterAttributeSet::RecalculateFromStamina(float NewStamina)
+void UCharacterAttributeSet::RecalculateFromStamina(float OldStamina, float NewStamina)
 {
-	// 1 Stamina = 10 Max Health
-	const float Diff = NewStamina - GetStamina();
-	const float OldMaxHealth = GetMaxHealth();
-	const float NewMaxHealth = OldMaxHealth + (Diff * 10.0f);
-	SetMaxHealth(NewMaxHealth);
+	const float Diff = NewStamina - OldStamina;
+	const float OldMaxHealth = GetAttributeBaseValue(GetMaxHealthAttribute());
+	const float NewMaxHealth = OldMaxHealth + (Diff * MaxHealthPerStamina);
+	SetAttributeBaseValue(GetMaxHealthAttribute(), NewMaxHealth);
 
-	// Proportional Health Adjustment
 	AdjustAttributeProportionally(GetHealthAttribute(), NewMaxHealth, OldMaxHealth);
+}
+
+void UCharacterAttributeSet::SetAttributeBaseValue(const FGameplayAttribute& Attribute, float NewValue) const
+{
+	if (UAbilitySystemComponent* ASC = GetOwningAbilitySystemComponent())
+	{
+		ASC->SetNumericAttributeBase(Attribute, NewValue);
+		return;
+	}
+
+	if (FGameplayAttributeData* AttributeData = Attribute.GetGameplayAttributeData(const_cast<UCharacterAttributeSet*>(this)))
+	{
+		AttributeData->SetBaseValue(NewValue);
+		AttributeData->SetCurrentValue(NewValue);
+	}
+}
+
+float UCharacterAttributeSet::GetAttributeBaseValue(const FGameplayAttribute& Attribute) const
+{
+	if (const FGameplayAttributeData* AttributeData = Attribute.GetGameplayAttributeData(this))
+	{
+		return AttributeData->GetBaseValue();
+	}
+
+	return Attribute.GetNumericValue(this);
+}
+
+void UCharacterAttributeSet::ApplyAdditiveAttributeBaseDelta(const FGameplayAttribute& Attribute, float Delta) const
+{
+	if (FMath::IsNearlyZero(Delta))
+	{
+		return;
+	}
+
+	SetAttributeBaseValue(Attribute, GetAttributeBaseValue(Attribute) + Delta);
 }
 
 void UCharacterAttributeSet::ClampHealth(float& NewValue) const
@@ -83,10 +286,27 @@ void UCharacterAttributeSet::ClampMana(float& NewValue) const
 	NewValue = FMath::Clamp(NewValue, 0.0f, GetMaxMana());
 }
 
+void UCharacterAttributeSet::ClampArmor(float& NewValue) const
+{
+	NewValue = FMath::Max(NewValue, 0.0f);
+}
+
+void UCharacterAttributeSet::ClampMagicResistance(float& NewValue) const
+{
+	NewValue = FMath::Max(NewValue, 0.0f);
+}
+
+void UCharacterAttributeSet::ClampCastSpeed(float& NewValue) const
+{
+	NewValue = FMath::Clamp(NewValue, 0.0f, MaxCastSpeedPercent);
+}
+
 void UCharacterAttributeSet::AdjustAttributeProportionally(const FGameplayAttribute& CurrentAttr, float NewMax, float OldMax)
 {
-	// Processing
-	if (OldMax <= 0.0f || NewMax == OldMax) return;
+	if (OldMax <= 0.0f || NewMax == OldMax)
+	{
+		return;
+	}
 
 	UAbilitySystemComponent* ASC = GetOwningAbilitySystemComponent();
 	if (!ASC)
@@ -97,16 +317,7 @@ void UCharacterAttributeSet::AdjustAttributeProportionally(const FGameplayAttrib
 	const float CurrentValue = CurrentAttr.GetNumericValue(this);
 	const float NewCurrentValue = CurrentValue * (NewMax / OldMax);
 
-	// Execution
-	// Internal implementation helper: SetNumericAttributeBase bypasses some validation but is efficient for relative adjustments
 	ASC->SetNumericAttributeBase(CurrentAttr, NewCurrentValue);
-}
-
-float UCharacterAttributeSet::CalculateHastedInterval(float BaseInterval, float AgilityValue) const
-{
-	// DRY: Single formula shared between Agility-change and WeaponInterval-change paths
-	const float Haste = AgilityValue * 0.01f;
-	return BaseInterval / FMath::Max(1.0f + Haste, 0.1f);
 }
 
 void UCharacterAttributeSet::PostGameplayEffectExecute(const FGameplayEffectModCallbackData& Data)
@@ -116,42 +327,34 @@ void UCharacterAttributeSet::PostGameplayEffectExecute(const FGameplayEffectModC
 	ClampPostEffectAttribute(Data.EvaluatedData.Attribute);
 }
 
-bool UCharacterAttributeSet::HandleDerivedAttributeChange(const FGameplayAttribute& Attribute, float& NewValue)
+void UCharacterAttributeSet::HandleDerivedAttributeChange(const FGameplayAttribute& Attribute, float OldValue, float NewValue)
 {
 	if (Attribute == GetStrengthAttribute())
 	{
-		RecalculateFromStrength(NewValue);
-		return true;
+		RecalculateFromStrength(OldValue, NewValue);
+		return;
 	}
 
 	if (Attribute == GetAgilityAttribute())
 	{
-		RecalculateFromAgility(NewValue);
-		return true;
-	}
-
-	if (Attribute == GetWeaponBaseIntervalAttribute())
-	{
-		RecalculateFromWeaponInterval(NewValue);
-		return true;
+		RecalculateFromAgility(OldValue, NewValue);
+		return;
 	}
 
 	if (Attribute == GetIntellectAttribute())
 	{
-		RecalculateFromIntellect(NewValue);
-		return true;
+		RecalculateFromIntellect(OldValue, NewValue);
+		return;
 	}
 
 	if (Attribute == GetStaminaAttribute())
 	{
-		RecalculateFromStamina(NewValue);
-		return true;
+		RecalculateFromStamina(OldValue, NewValue);
+		return;
 	}
-
-	return false;
 }
 
-bool UCharacterAttributeSet::HandleClampedVitalChange(const FGameplayAttribute& Attribute, float& NewValue) const
+bool UCharacterAttributeSet::HandleClampedAttributeChange(const FGameplayAttribute& Attribute, float& NewValue) const
 {
 	if (Attribute == GetHealthAttribute())
 	{
@@ -162,6 +365,24 @@ bool UCharacterAttributeSet::HandleClampedVitalChange(const FGameplayAttribute& 
 	if (Attribute == GetManaAttribute())
 	{
 		ClampMana(NewValue);
+		return true;
+	}
+
+	if (Attribute == GetArmorAttribute())
+	{
+		ClampArmor(NewValue);
+		return true;
+	}
+
+	if (Attribute == GetMagicResistanceAttribute())
+	{
+		ClampMagicResistance(NewValue);
+		return true;
+	}
+
+	if (Attribute == GetCastSpeedAttribute())
+	{
+		ClampCastSpeed(NewValue);
 		return true;
 	}
 
@@ -183,5 +404,29 @@ void UCharacterAttributeSet::ClampPostEffectAttribute(const FGameplayAttribute& 
 		float Value = GetMana();
 		ClampMana(Value);
 		SetMana(Value);
+		return;
+	}
+
+	if (Attribute == GetArmorAttribute())
+	{
+		float Value = GetArmor();
+		ClampArmor(Value);
+		SetArmor(Value);
+		return;
+	}
+
+	if (Attribute == GetMagicResistanceAttribute())
+	{
+		float Value = GetMagicResistance();
+		ClampMagicResistance(Value);
+		SetMagicResistance(Value);
+		return;
+	}
+
+	if (Attribute == GetCastSpeedAttribute())
+	{
+		float Value = GetCastSpeed();
+		ClampCastSpeed(Value);
+		SetCastSpeed(Value);
 	}
 }

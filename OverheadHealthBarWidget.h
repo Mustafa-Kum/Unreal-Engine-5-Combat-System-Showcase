@@ -28,7 +28,8 @@ public:
 protected:
 	virtual void NativeConstruct() override;
 	virtual void NativeDestruct() override;
-	virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
+	virtual bool HasAdditionalScheduledWork() const override;
+	virtual void ProcessAdditionalScheduledWork(float DeltaTime) override;
 
 private:
 	struct FDamageTextEntry

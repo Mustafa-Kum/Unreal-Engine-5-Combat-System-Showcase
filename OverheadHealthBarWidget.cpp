@@ -58,6 +58,8 @@ void UOverheadHealthBarWidget::ShowDamageText(float DamageAmount, bool bIsCritic
 	DamageTextEntry.StartPosition = StartPosition;
 	DamageTextEntry.EndPosition = bIsCriticalHit ? StartPosition : (StartPosition + FVector2D(0.0f, -DamageTextRiseDistance));
 	DamageTextEntry.bIsCriticalHit = bIsCriticalHit;
+
+	RefreshScheduledUpdateState();
 }
 
 void UOverheadHealthBarWidget::NativeDestruct()
@@ -67,19 +69,22 @@ void UOverheadHealthBarWidget::NativeDestruct()
 	Super::NativeDestruct();
 }
 
-void UOverheadHealthBarWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
-{
-	Super::NativeTick(MyGeometry, InDeltaTime);
-
-	if (!ActiveDamageTextEntries.IsEmpty())
-	{
-		UpdateDamageTextEntries(InDeltaTime);
-	}
-}
-
 bool UOverheadHealthBarWidget::CanDisplayDamageText(float DamageAmount) const
 {
 	return DamageAmount > 0.0f && DamageTextLayer;
+}
+
+bool UOverheadHealthBarWidget::HasAdditionalScheduledWork() const
+{
+	return !ActiveDamageTextEntries.IsEmpty();
+}
+
+void UOverheadHealthBarWidget::ProcessAdditionalScheduledWork(float DeltaTime)
+{
+	if (!ActiveDamageTextEntries.IsEmpty())
+	{
+		UpdateDamageTextEntries(DeltaTime);
+	}
 }
 
 float UOverheadHealthBarWidget::GetTotalDamageTextLifetime() const

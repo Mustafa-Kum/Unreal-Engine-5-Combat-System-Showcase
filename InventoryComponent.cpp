@@ -1,9 +1,9 @@
 #include "Components/InventoryComponent.h"
 #include "Characters/CharacterBase.h"
+#include "Components/EquipmentComponent.h"
+#include "Components/WeaponActionComponent.h"
 #include "DataAssets/ItemDataAsset.h"
 #include "DataAssets/WeaponDataAsset.h"
-#include "Engine/AssetManager.h"
-#include "Engine/StreamableManager.h"
 
 // Custom Log Category
 DEFINE_LOG_CATEGORY_STATIC(LogInventory, Log, All);
@@ -27,7 +27,20 @@ void UInventoryComponent::BeginPlay()
 		return;
 	}
 
-	OwnerCharacter->OnWeaponActionFinished.AddUObject(this, &UInventoryComponent::OnWeaponActionCompleted);
+	if (!GetEquipmentComponent())
+	{
+		UE_LOG(LogInventory, Error, TEXT("InventoryComponent requires EquipmentComponent on %s."), *GetNameSafe(OwnerCharacter));
+		return;
+	}
+
+	UWeaponActionComponent* WeaponActionComp = GetWeaponActionComponent();
+	if (!WeaponActionComp)
+	{
+		UE_LOG(LogInventory, Error, TEXT("InventoryComponent requires WeaponActionComponent on %s."), *GetNameSafe(OwnerCharacter));
+		return;
+	}
+
+	WeaponTransitionCompletedDelegateHandle = WeaponActionComp->OnWeaponTransitionCompleted.AddUObject(this, &UInventoryComponent::HandleWeaponTransitionCompleted);
 
 	if (DefaultStartingItem)
 	{
@@ -124,13 +137,15 @@ bool UInventoryComponent::ConsumeItemAtIndex(int32 SlotIndex)
 	UItemDataAsset* ItemToConsume = InventorySlots[SlotIndex].ItemData;
 	if (!ItemToConsume || ItemToConsume->ItemData.ItemType != EItemType::Consumable) return false;
 
+	UEquipmentComponent* EquipmentComp = GetEquipmentComponent();
+	if (!EquipmentComp)
+	{
+		return false;
+	}
+
 	// AAA: Cache name before potential slot clear to avoid fragile pointer access
 	const FString ConsumedItemName = ItemToConsume->ItemData.ItemName.ToString();
-
-	if (OwnerCharacter)
-	{
-		OwnerCharacter->ApplyConsumableEffect(ItemToConsume);
-	}
+	EquipmentComp->ApplyConsumableEffect(ItemToConsume);
 
 	InventorySlots[SlotIndex].Quantity--;
 	const int32 RemainingQuantity = InventorySlots[SlotIndex].Quantity;
@@ -166,6 +181,12 @@ bool UInventoryComponent::Internal_ProcessEquipFlow(int32 Index, EEquipmentSlot 
 
 bool UInventoryComponent::ProcessEquipBackend(int32 Index, EEquipmentSlot TargetSlot, UItemDataAsset* ItemToEquip)
 {
+	UEquipmentComponent* EquipmentComp = GetEquipmentComponent();
+	if (!EquipmentComp)
+	{
+		return false;
+	}
+
 	if (!HandleTwoHandedEquipConstraints(ItemToEquip, TargetSlot))
 	{
 		return false;
@@ -173,13 +194,15 @@ bool UInventoryComponent::ProcessEquipBackend(int32 Index, EEquipmentSlot Target
 
 	if (HasItemEquippedAtSlot(TargetSlot))
 	{
-		Internal_SwapEquippedWithInventory(Index, TargetSlot);
+		if (!Internal_SwapEquippedWithInventory(Index, TargetSlot))
+		{
+			return false;
+		}
 	}
 	else
 	{
-		EquippedItems.Add(TargetSlot, ItemToEquip);
+		EquipmentComp->EquipItem(ItemToEquip, TargetSlot);
 		SetItemAtIndexInternal(nullptr, 0, Index, false);
-		MountItemStats(ItemToEquip);
 	}
 
 	return true;
@@ -210,11 +233,11 @@ bool UInventoryComponent::HandleTwoHandedEquipConstraints(UItemDataAsset* ItemTo
 
 void UInventoryComponent::ExecuteEquipVisuals(EEquipmentSlot TargetSlot)
 {
-	if (UWeaponDataAsset* WeaponData = Cast<UWeaponDataAsset>(GetEquippedItem(TargetSlot)))
+	if (HasDeferredMainHandSwap())
 	{
-		OwnerCharacter->SetPendingWeapon(WeaponData);
+		return;
 	}
-	
+
 	BroadcastInventoryUpdated();
 	
 	if (UItemDataAsset* EquippedItem = GetEquippedItem(TargetSlot))
@@ -223,49 +246,51 @@ void UInventoryComponent::ExecuteEquipVisuals(EEquipmentSlot TargetSlot)
 	}
 }
 
-void UInventoryComponent::Internal_SwapEquippedWithInventory(int32 Index, EEquipmentSlot TargetSlot)
+bool UInventoryComponent::Internal_SwapEquippedWithInventory(int32 Index, EEquipmentSlot TargetSlot)
 {
-	UItemDataAsset* ItemToBag = GetEquippedItem(TargetSlot);
 	UItemDataAsset* ItemToHand = InventorySlots[Index].ItemData;
+	if (!ItemToHand)
+	{
+		return false;
+	}
 
-	DismountItemStats(ItemToBag);
-	
-	SetItemAtIndexInternal(ItemToBag, 1, Index, false); // Unstacking to bag
-	EquippedItems.Add(TargetSlot, ItemToHand);
+	if (UEquipmentComponent* EquipmentComp = GetEquipmentComponent())
+	{
+		if (BeginDeferredMainHandSwap(Index, TargetSlot, ItemToHand))
+		{
+			return true;
+		}
 
-	MountItemStats(ItemToHand);
+		UItemDataAsset* ItemToBag = EquipmentComp->UnequipItem(TargetSlot);
+		if (!ItemToBag)
+		{
+			return false;
+		}
+
+		EquipmentComp->EquipItem(ItemToHand, TargetSlot);
+		SetItemAtIndexInternal(ItemToBag, 1, Index, false); // Unstacking to bag
+		return true;
+	}
+
+	return false;
 }
 
 bool UInventoryComponent::HasItemEquippedAtSlot(EEquipmentSlot Slot) const
 {
-	return EquippedItems.Contains(Slot) && EquippedItems[Slot] != nullptr;
+	if (const UEquipmentComponent* EquipmentComp = GetEquipmentComponent())
+	{
+		return EquipmentComp->HasItemEquippedAtSlot(Slot);
+	}
+
+	return false;
 }
 
 void UInventoryComponent::ToggleDrawHolster()
 {
-	if (!CanPerformWeaponAction()) return;
-
-	UWeaponDataAsset* MainHandWeapon = Cast<UWeaponDataAsset>(GetEquippedItem(EEquipmentSlot::MainHand));
-	if (!MainHandWeapon) return;
-
-	const bool bIsDrawing = !OwnerCharacter->HasWeaponEquipped();
-	Internal_HandleWeaponTransition(MainHandWeapon, bIsDrawing);
-}
-
-void UInventoryComponent::Internal_HandleWeaponTransition(UWeaponDataAsset* WeaponToTransition, bool bIsEquipping)
-{
-	const EWeaponEquipState RequestedState = bIsEquipping ? EWeaponEquipState::Equipping : EWeaponEquipState::Unequipping;
-	SetEquipState(RequestedState);
-	PendingWeaponTransitionData = WeaponToTransition;
-	PendingWeaponTransitionState = RequestedState;
-	++PendingWeaponTransitionRequestId;
-	
-	if (bIsEquipping)
+	if (UWeaponActionComponent* WeaponActionComp = GetWeaponActionComponent())
 	{
-		OwnerCharacter->SetPendingWeapon(WeaponToTransition);
+		WeaponActionComp->ToggleDrawHolster();
 	}
-
-	ExecuteVisualTransition(WeaponToTransition, bIsEquipping);
 }
 
 bool UInventoryComponent::UnequipItem(EEquipmentSlot Slot)
@@ -281,6 +306,17 @@ bool UInventoryComponent::UnequipItemToSlot(EEquipmentSlot Slot, int32 TargetInd
 
 bool UInventoryComponent::Internal_ProcessUnequipFlow(EEquipmentSlot Slot, int32 TargetIndex)
 {
+	UEquipmentComponent* EquipmentComp = GetEquipmentComponent();
+	if (!EquipmentComp)
+	{
+		return false;
+	}
+
+	if (IsWeaponActionInProgress())
+	{
+		return false;
+	}
+
 	if (!HasItemEquippedAtSlot(Slot)) return false;
 
 	UItemDataAsset* ItemToUnequip = GetEquippedItem(Slot);
@@ -291,18 +327,29 @@ bool UInventoryComponent::Internal_ProcessUnequipFlow(EEquipmentSlot Slot, int32
 		return false;
 	}
 
-	DismountItemStats(ItemToUnequip);
-	
-	EquippedItems.Remove(Slot);
+	UWeaponDataAsset* WeaponToUnequip = Cast<UWeaponDataAsset>(ItemToUnequip);
+	const bool bRequiresWeaponTransition = WeaponToUnequip != nullptr && EquipmentComp->HasWeaponEquipped();
+	if (bRequiresWeaponTransition)
+	{
+		UWeaponActionComponent* WeaponActionComp = GetWeaponActionComponent();
+		if (!WeaponActionComp || !WeaponActionComp->BeginWeaponTransition(WeaponToUnequip, false))
+		{
+			return false;
+		}
+	}
+
+	UItemDataAsset* RemovedItem = EquipmentComp->UnequipItem(Slot);
+	if (!RemovedItem)
+	{
+		return false;
+	}
+
+	ItemToUnequip = RemovedItem;
 	SetItemAtIndexInternal(ItemToUnequip, 1, DestinationIndex, false);
 
-	if (UWeaponDataAsset* WeaponToUnequip = Cast<UWeaponDataAsset>(ItemToUnequip))
+	if (WeaponToUnequip)
 	{
-		if (OwnerCharacter->HasWeaponEquipped())
-		{
-			Internal_HandleWeaponTransition(WeaponToUnequip, false);
-		}
-		else
+		if (!bRequiresWeaponTransition)
 		{
 			ExecuteInstantClear();
 		}
@@ -315,110 +362,128 @@ bool UInventoryComponent::Internal_ProcessUnequipFlow(EEquipmentSlot Slot, int32
 	return true;
 }
 
-void UInventoryComponent::MountItemStats(UItemDataAsset* Item)
-{
-	if (OwnerCharacter && Item)
-	{
-		OwnerCharacter->ApplyItemStats(Item);
-	}
-}
-
-void UInventoryComponent::DismountItemStats(UItemDataAsset* Item)
-{
-	if (OwnerCharacter && Item)
-	{
-		OwnerCharacter->RemoveItemStats(Item);
-	}
-}
-
-void UInventoryComponent::ExecuteVisualTransition(UWeaponDataAsset* WeaponData, bool bIsEquipping)
-{
-	const TSoftObjectPtr<UAnimMontage>& Montage = bIsEquipping ? WeaponData->WeaponData.EquipMontage : WeaponData->WeaponData.UnequipMontage;
-	ProcessMontageLoad(WeaponData, Montage, bIsEquipping);
-}
-
 void UInventoryComponent::ExecuteInstantClear()
 {
-	if (OwnerCharacter)
+	if (UEquipmentComponent* EquipmentComp = GetEquipmentComponent())
 	{
-		OwnerCharacter->ClearWeaponMesh();
+		EquipmentComp->ClearWeaponMesh();
 	}
 	BroadcastInventoryUpdated();
 }
 
-void UInventoryComponent::OnEquipMontageLoaded(UWeaponDataAsset* WeaponToEquip, int32 RequestId)
-{
-	PlayWeaponMontage(WeaponToEquip, EWeaponEquipState::Equipping, RequestId);
-}
-
-void UInventoryComponent::OnUnequipMontageLoaded(UWeaponDataAsset* WeaponToUnequip, int32 RequestId)
-{
-	PlayWeaponMontage(WeaponToUnequip, EWeaponEquipState::Unequipping, RequestId);
-}
-
 void UInventoryComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	if (OwnerCharacter)
+	if (UWeaponActionComponent* WeaponActionComp = GetWeaponActionComponent())
 	{
-		OwnerCharacter->OnWeaponActionFinished.RemoveAll(this);
+		if (WeaponTransitionCompletedDelegateHandle.IsValid())
+		{
+			WeaponActionComp->OnWeaponTransitionCompleted.Remove(WeaponTransitionCompletedDelegateHandle);
+			WeaponTransitionCompletedDelegateHandle.Reset();
+		}
 	}
-	ClearPendingWeaponTransition();
+
+	ClearDeferredMainHandSwap();
+	CachedWeaponAction.Reset();
+	CachedEquipment.Reset();
+
 	Super::EndPlay(EndPlayReason);
 }
 
-void UInventoryComponent::OnWeaponActionCompleted()
+void UInventoryComponent::HandleWeaponTransitionCompleted(EWeaponEquipState CompletedState)
 {
-	const EWeaponEquipState PreviousState = WeaponEquipState;
-
-	if (PreviousState == EWeaponEquipState::Unequipping)
+	if (CompletedState == EWeaponEquipState::Unequipping)
 	{
+		if (HasDeferredMainHandSwap())
+		{
+			FinalizeDeferredMainHandSwap();
+			return;
+		}
+
 		FinalizeUnequipAction();
 	}
-
-	SetEquipState(EWeaponEquipState::Idle);
-	ClearPendingWeaponTransition();
 }
 
 void UInventoryComponent::FinalizeUnequipAction()
 {
 	// Assuming the map still doesn't have it since we removed it in Internal_ProcessUnequipFlow
-	if (!HasItemEquippedAtSlot(EEquipmentSlot::MainHand) && OwnerCharacter)
+	if (!HasItemEquippedAtSlot(EEquipmentSlot::MainHand))
 	{
-		OwnerCharacter->ClearWeaponMesh();
+		if (UEquipmentComponent* EquipmentComp = GetEquipmentComponent())
+		{
+			EquipmentComp->ClearWeaponMesh();
+		}
 	}
 
 	BroadcastInventoryUpdated();
 }
 
-void UInventoryComponent::SetEquipState(EWeaponEquipState NewState)
+bool UInventoryComponent::BeginDeferredMainHandSwap(int32 Index, EEquipmentSlot TargetSlot, UItemDataAsset* IncomingItem)
 {
-	WeaponEquipState = NewState;
+	if (TargetSlot != EEquipmentSlot::MainHand || !IncomingItem)
+	{
+		return false;
+	}
+
+	UEquipmentComponent* EquipmentComp = GetEquipmentComponent();
+	UWeaponActionComponent* WeaponActionComp = GetWeaponActionComponent();
+	UWeaponDataAsset* EquippedWeapon = EquipmentComp ? Cast<UWeaponDataAsset>(EquipmentComp->GetEquippedItem(TargetSlot)) : nullptr;
+	if (!EquipmentComp || !WeaponActionComp || !EquippedWeapon || !EquipmentComp->HasWeaponEquipped())
+	{
+		return false;
+	}
+
+	if (!WeaponActionComp->BeginWeaponTransition(EquippedWeapon, false))
+	{
+		return false;
+	}
+
+	PendingMainHandSwapInventoryIndex = Index;
+	PendingMainHandSwapSlot = TargetSlot;
+	PendingMainHandSwapIncomingItem = IncomingItem;
+	return true;
 }
 
-void UInventoryComponent::PlayWeaponMontage(UWeaponDataAsset* WeaponData, EWeaponEquipState ExpectedState, int32 RequestId)
+void UInventoryComponent::FinalizeDeferredMainHandSwap()
 {
-	if (!IsWeaponTransitionRequestCurrent(WeaponData, ExpectedState, RequestId))
+	if (!HasDeferredMainHandSwap())
 	{
 		return;
 	}
 
-	const TSoftObjectPtr<UAnimMontage>& Montage = (ExpectedState == EWeaponEquipState::Equipping)
-		? WeaponData->WeaponData.EquipMontage
-		: WeaponData->WeaponData.UnequipMontage;
+	UEquipmentComponent* EquipmentComp = GetEquipmentComponent();
+	UItemDataAsset* IncomingItem = PendingMainHandSwapIncomingItem;
+	const int32 SourceIndex = PendingMainHandSwapInventoryIndex;
+	const EEquipmentSlot TargetSlot = PendingMainHandSwapSlot;
+	ClearDeferredMainHandSwap();
 
-	if (!OwnerCharacter || !Montage.IsValid())
+	if (!EquipmentComp || !IncomingItem || !InventorySlots.IsValidIndex(SourceIndex))
 	{
-		SnapWeaponWithoutAnimation(ExpectedState == EWeaponEquipState::Equipping);
 		return;
 	}
 
-	if (OwnerCharacter->PlayAnimMontage(Montage.Get()) <= 0.0f)
+	UItemDataAsset* RemovedItem = EquipmentComp->UnequipItem(TargetSlot);
+	if (!RemovedItem)
 	{
-		UE_LOG(LogInventory, Warning, TEXT("Failed to play %s montage for weapon %s. Falling back to notify-free transition."),
-			ExpectedState == EWeaponEquipState::Equipping ? TEXT("equip") : TEXT("unequip"),
-			*GetNameSafe(WeaponData));
-		SnapWeaponWithoutAnimation(ExpectedState == EWeaponEquipState::Equipping);
+		return;
 	}
+
+	EquipmentComp->EquipItem(IncomingItem, TargetSlot);
+	SetItemAtIndexInternal(RemovedItem, 1, SourceIndex, false);
+	ExecuteEquipVisuals(TargetSlot);
+}
+
+void UInventoryComponent::ClearDeferredMainHandSwap()
+{
+	PendingMainHandSwapIncomingItem = nullptr;
+	PendingMainHandSwapInventoryIndex = INDEX_NONE;
+	PendingMainHandSwapSlot = EEquipmentSlot::None;
+}
+
+bool UInventoryComponent::HasDeferredMainHandSwap() const
+{
+	return PendingMainHandSwapIncomingItem != nullptr
+		&& PendingMainHandSwapInventoryIndex != INDEX_NONE
+		&& PendingMainHandSwapSlot != EEquipmentSlot::None;
 }
 
 bool UInventoryComponent::CanEquipItem(int32 Index, EEquipmentSlot TargetSlot) const
@@ -428,11 +493,6 @@ bool UInventoryComponent::CanEquipItem(int32 Index, EEquipmentSlot TargetSlot) c
 	
 	// AAA Backend Validation: Ensure item fits the destination slot
 	return InventorySlots[Index].ItemData->ItemData.ValidEquipmentSlot == TargetSlot;
-}
-
-bool UInventoryComponent::CanPerformWeaponAction() const
-{
-	return OwnerCharacter && HasItemEquippedAtSlot(EEquipmentSlot::MainHand) && !IsWeaponActionInProgress() && !OwnerCharacter->IsInCombat();
 }
 
 bool UInventoryComponent::SwapInventorySlots(int32 SourceIndex, int32 TargetIndex)
@@ -447,21 +507,6 @@ bool UInventoryComponent::SwapInventorySlots(int32 SourceIndex, int32 TargetInde
 	return true;
 }
 
-bool UInventoryComponent::PrepareWeaponForCombat()
-{
-	if (!OwnerCharacter)
-	{
-		return false;
-	}
-
-	if (!EnsureCombatWeaponEquipped())
-	{
-		return false;
-	}
-
-	return EnsureCombatWeaponDrawn();
-}
-
 UItemDataAsset* UInventoryComponent::GetItemAtIndex(int32 Index) const
 {
 	return InventorySlots.IsValidIndex(Index) ? InventorySlots[Index].ItemData : nullptr;
@@ -474,74 +519,12 @@ int32 UInventoryComponent::GetItemQuantityAtIndex(int32 Index) const
 
 UItemDataAsset* UInventoryComponent::GetEquippedItem(EEquipmentSlot Slot) const
 {
-	return EquippedItems.FindRef(Slot);
-}
-
-int32 UInventoryComponent::FindFirstEquippableItemIndex(EEquipmentSlot TargetSlot) const
-{
-	for (int32 Index = 0; Index < InventorySlots.Num(); ++Index)
+	if (const UEquipmentComponent* EquipmentComp = GetEquipmentComponent())
 	{
-		if (const UItemDataAsset* ItemData = GetItemAtIndex(Index))
-		{
-			if (ItemData->ItemData.ValidEquipmentSlot == TargetSlot)
-			{
-				return Index;
-			}
-		}
+		return EquipmentComp->GetEquippedItem(Slot);
 	}
 
-	return INDEX_NONE;
-}
-
-void UInventoryComponent::ProcessMontageLoad(UWeaponDataAsset* WeaponData, const TSoftObjectPtr<UAnimMontage>& MontageToLoad, bool bIsEquipping)
-{
-	if (MontageToLoad.IsPending()) HandlePendingMontage(WeaponData, MontageToLoad, bIsEquipping);
-	else if (MontageToLoad.IsValid()) HandleValidMontage(WeaponData, bIsEquipping);
-	else HandleMissingMontage(bIsEquipping);
-}
-
-void UInventoryComponent::HandlePendingMontage(UWeaponDataAsset* WeaponData, const TSoftObjectPtr<UAnimMontage>& MontageToLoad, bool bIsEquipping)
-{
-	const int32 RequestId = PendingWeaponTransitionRequestId;
-	FStreamableDelegate Delegate = bIsEquipping 
-		? FStreamableDelegate::CreateUObject(this, &UInventoryComponent::OnEquipMontageLoaded, WeaponData, RequestId)
-		: FStreamableDelegate::CreateUObject(this, &UInventoryComponent::OnUnequipMontageLoaded, WeaponData, RequestId);
-		
-	UAssetManager::GetStreamableManager().RequestAsyncLoad(MontageToLoad.ToSoftObjectPath(), Delegate);
-}
-
-void UInventoryComponent::HandleValidMontage(UWeaponDataAsset* WeaponData, bool bIsEquipping)
-{
-	const int32 RequestId = PendingWeaponTransitionRequestId;
-	bIsEquipping ? OnEquipMontageLoaded(WeaponData, RequestId) : OnUnequipMontageLoaded(WeaponData, RequestId);
-}
-
-void UInventoryComponent::HandleMissingMontage(bool bIsEquipping)
-{
-	SnapWeaponWithoutAnimation(bIsEquipping);
-}
-
-void UInventoryComponent::SnapWeaponWithoutAnimation(bool bIsEquipping)
-{
-	if (!OwnerCharacter) return;
-
-	bIsEquipping ? OwnerCharacter->OnWeaponEquipNotify() : OwnerCharacter->OnWeaponUnequipNotify();
-}
-
-bool UInventoryComponent::IsWeaponTransitionRequestCurrent(UWeaponDataAsset* WeaponData, EWeaponEquipState ExpectedState, int32 RequestId) const
-{
-	return OwnerCharacter
-		&& WeaponData
-		&& WeaponEquipState == ExpectedState
-		&& PendingWeaponTransitionState == ExpectedState
-		&& PendingWeaponTransitionData == WeaponData
-		&& PendingWeaponTransitionRequestId == RequestId;
-}
-
-void UInventoryComponent::ClearPendingWeaponTransition()
-{
-	PendingWeaponTransitionData = nullptr;
-	PendingWeaponTransitionState = EWeaponEquipState::Idle;
+	return nullptr;
 }
 
 void UInventoryComponent::SetItemAtIndexInternal(UItemDataAsset* Item, int32 Quantity, int32 Index, bool bBroadcast)
@@ -575,31 +558,14 @@ bool UInventoryComponent::HasValidInventoryItemAtIndex(int32 Index) const
 	return InventorySlots.IsValidIndex(Index) && InventorySlots[Index].IsValid();
 }
 
-bool UInventoryComponent::EnsureCombatWeaponEquipped()
+bool UInventoryComponent::IsWeaponActionInProgress() const
 {
-	if (HasItemEquippedAtSlot(EEquipmentSlot::MainHand))
+	if (const UWeaponActionComponent* WeaponActionComp = GetWeaponActionComponent())
 	{
-		return true;
+		return WeaponActionComp->IsWeaponActionInProgress();
 	}
 
-	const int32 WeaponIndex = FindFirstEquippableItemIndex(EEquipmentSlot::MainHand);
-	return WeaponIndex != INDEX_NONE && EquipItemAtIndex(WeaponIndex, EEquipmentSlot::MainHand);
-}
-
-bool UInventoryComponent::EnsureCombatWeaponDrawn()
-{
-	if (OwnerCharacter->HasWeaponEquipped())
-	{
-		return true;
-	}
-
-	if (!CanPerformWeaponAction())
-	{
-		return false;
-	}
-
-	ToggleDrawHolster();
-	return true;
+	return false;
 }
 
 int32 UInventoryComponent::ResolveUnequipTargetIndex(UItemDataAsset* ItemToUnequip, int32 PreferredIndex) const
@@ -627,4 +593,24 @@ void UInventoryComponent::NormalizeSlotWrite(UItemDataAsset*& Item, int32& Quant
 	}
 
 	Quantity = FMath::Clamp(Quantity, 1, Item->ItemData.MaxStackSize);
+}
+
+UEquipmentComponent* UInventoryComponent::GetEquipmentComponent() const
+{
+	if (!CachedEquipment.IsValid() && OwnerCharacter)
+	{
+		CachedEquipment = OwnerCharacter->FindComponentByClass<UEquipmentComponent>();
+	}
+
+	return CachedEquipment.Get();
+}
+
+UWeaponActionComponent* UInventoryComponent::GetWeaponActionComponent() const
+{
+	if (!CachedWeaponAction.IsValid() && OwnerCharacter)
+	{
+		CachedWeaponAction = OwnerCharacter->FindComponentByClass<UWeaponActionComponent>();
+	}
+
+	return CachedWeaponAction.Get();
 }

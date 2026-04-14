@@ -1,4 +1,5 @@
 #include "Characters/HeroCharacter.h"
+#include "AModularRPGPlayerController.h"
 #include "Characters/HeroInputComponent.h"
 #include "Characters/HeroCameraComponent.h"
 #include "Characters/HeroLocomotionComponent.h"
@@ -9,13 +10,9 @@
 #include "Camera/CameraComponent.h"
 #include "Components/InventoryComponent.h"
 #include "Components/CombatComponent.h"
+#include "Components/AbilityLoadoutComponent.h"
+#include "Components/WeaponActionComponent.h"
 #include "DataAssets/WeaponDataAsset.h"
-#include "AbilitySystemComponent.h"
-#include "Abilities/AttributeSets/CharacterAttributeSet.h"
-#include "WoWCloneGameplayTags.h"
-#include "UI/InventoryWidget.h"
-#include "UI/PlayerVitalsWidget.h"
-#include "Blueprint/UserWidget.h"
 
 AHeroCharacter::AHeroCharacter()
 {
@@ -29,9 +26,8 @@ AHeroCharacter::AHeroCharacter()
 	bUseControllerRotationRoll = false;
 
 	// Reset bit-packed booleans (AAA Standards)
-	bIsRightClickPressed = 0;
-	bIsLeftClickPressed = 0;
-	bIsInCombat = 0;
+	bIsHeavyAttackPressed = 0;
+	bIsLightAttackPressed = 0;
 
 	// Default initialization prevents warnings; proper values set in component
 	GetCharacterMovement()->bOrientRotationToMovement = false;
@@ -55,8 +51,14 @@ AHeroCharacter::AHeroCharacter()
 	// Inventory Setup
 	InventoryComp = CreateDefaultSubobject<UInventoryComponent>(TEXT("InventoryComponent"));
 
+	// Weapon runtime transitions live outside inventory data ownership.
+	WeaponActionComp = CreateDefaultSubobject<UWeaponActionComponent>(TEXT("WeaponActionComponent"));
+
 	// Combat Setup
 	CombatComp = CreateDefaultSubobject<UCombatComponent>(TEXT("CombatComponent"));
+
+	// Hotbar/loadout state belongs to a gameplay component, not the UI.
+	AbilityLoadoutComp = CreateDefaultSubobject<UAbilityLoadoutComponent>(TEXT("AbilityLoadoutComponent"));
 }
 
 void AHeroCharacter::BeginPlay()
@@ -64,20 +66,20 @@ void AHeroCharacter::BeginPlay()
 	Super::BeginPlay();
 	
 	InitializeComponents();
-	InitializeCombatState();
 	InitializePlayerInputState();
 	InitializeHUD();
 }
 
+void AHeroCharacter::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	Super::EndPlay(EndPlayReason);
+}
+
 void AHeroCharacter::InitializePlayerInputState()
 {
-	if (APlayerController* PC = GetPlayerController(); PC && IsLocalPlayerControlled())
+	if (GetPlayerController() && IsLocalPlayerControlled())
 	{
-		PC->bShowMouseCursor = true;
-		
-		FInputModeGameAndUI InputMode;
-		InputMode.SetHideCursorDuringCapture(false);
-		PC->SetInputMode(InputMode);
+		SetCharacterYawDecoupled(true);
 	}
 }
 
@@ -96,27 +98,14 @@ void AHeroCharacter::InitializeComponents()
 
 void AHeroCharacter::InitializeHUD()
 {
-	if (PlayerVitalsWidgetInstance || !PlayerVitalsWidgetClass || !IsLocalPlayerControlled())
+	if (!IsLocalPlayerControlled())
 	{
 		return;
 	}
 
-	if (APlayerController* PC = GetPlayerController())
+	if (AModularRPGPlayerController* PC = Cast<AModularRPGPlayerController>(GetPlayerController()))
 	{
-		PlayerVitalsWidgetInstance = CreateWidget<UPlayerVitalsWidget>(PC, PlayerVitalsWidgetClass);
-		if (PlayerVitalsWidgetInstance)
-		{
-			PlayerVitalsWidgetInstance->AddToViewport();
-			PlayerVitalsWidgetInstance->InitializeVitals(GetAbilitySystemComponent());
-		}
-	}
-}
-
-void AHeroCharacter::InitializeCombatState()
-{
-	if (UAbilitySystemComponent* ASC = GetAbilitySystemComponent())
-	{
-		ASC->AddLooseGameplayTag(WoWCloneTags::State_Uncombat);
+		PC->InitializeHeroUI();
 	}
 }
 
@@ -127,7 +116,7 @@ float AHeroCharacter::GetBackwardMovementSpeedMultiplier() const
 
 bool AHeroCharacter::IsInCombat() const
 {
-	return bIsInCombat;
+	return CombatComp && CombatComp->IsInCombat();
 }
 
 void AHeroCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
@@ -177,9 +166,6 @@ FVector AHeroCharacter::GetMovementDirection(EAxis::Type Axis) const
 
 void AHeroCharacter::Look(const FInputActionValue& Value)
 {
-	// Disallow camera rotation if Left Click is pressed (Action Combat style)
-	if (bIsLeftClickPressed) return;
-
 	const FVector2D LookAxisVector = Value.Get<FVector2D>();
 
 	if (Controller != nullptr && !LookAxisVector.IsZero())
@@ -194,20 +180,19 @@ void AHeroCharacter::HandleLookInput(const FVector2D& LookAxisVector)
 	AddControllerPitchInput(LookAxisVector.Y);
 }
 
-void AHeroCharacter::RightClickStarted()
+void AHeroCharacter::HeavyAttackStarted()
 {
-	bIsRightClickPressed = 1;
+	bIsHeavyAttackPressed = 1;
 
-	// Allow the character to face exactly where the camera is looking
-	SetCharacterYawDecoupled(true);
+	if (CombatComp)
+	{
+		CombatComp->ProcessAttackInput(ECombatAttackType::Heavy);
+	}
 }
 
-void AHeroCharacter::RightClickCompleted()
+void AHeroCharacter::HeavyAttackCompleted()
 {
-	bIsRightClickPressed = 0;
-
-	// Decouple character rotation from the camera
-	SetCharacterYawDecoupled(false);
+	bIsHeavyAttackPressed = 0;
 }
 
 void AHeroCharacter::SetCharacterYawDecoupled(bool bIsDecoupled)
@@ -231,27 +216,32 @@ void AHeroCharacter::ConfigureRotationSettings(bool bIsDecoupled)
 	}
 }
 
-void AHeroCharacter::LeftClickStarted()
+void AHeroCharacter::LightAttackStarted()
 {
-	bIsLeftClickPressed = 1;
+	bIsLightAttackPressed = 1;
 
 	if (CombatComp)
 	{
-		CombatComp->ProcessAttack();
+		CombatComp->ProcessAttackInput(ECombatAttackType::Light);
 	}
 }
 
-void AHeroCharacter::LeftClickCompleted()
+void AHeroCharacter::LightAttackCompleted()
 {
-	bIsLeftClickPressed = 0;
+	bIsLightAttackPressed = 0;
 	// No longer hiding/showing cursor here to avoid conflict with look input
 }
 
-void AHeroCharacter::SetMouseCursorVisibility(bool bIsVisible)
+void AHeroCharacter::ActivatePrimaryAbility()
 {
-	if (APlayerController* PC = GetPlayerController())
+	ActivateActionBarSlot(0);
+}
+
+void AHeroCharacter::ActivateActionBarSlot(int32 SlotIndex)
+{
+	if (AbilityLoadoutComp)
 	{
-		PC->bShowMouseCursor = bIsVisible;
+		AbilityLoadoutComp->TryActivateSlot(SlotIndex);
 	}
 }
 
@@ -267,9 +257,9 @@ void AHeroCharacter::Zoom(const FInputActionValue& Value)
 
 void AHeroCharacter::ToggleWeapon()
 {
-	if (InventoryComp)
+	if (WeaponActionComp)
 	{
-		InventoryComp->ToggleDrawHolster();
+		WeaponActionComp->ToggleDrawHolster();
 	}
 }
 
@@ -283,7 +273,7 @@ void AHeroCharacter::ToggleWalk()
 
 bool AHeroCharacter::CanToggleWalk() const
 {
-	return !bIsInCombat;
+	return !IsInCombat();
 }
 
 void AHeroCharacter::HandleWalkSpeedToggle()
@@ -294,123 +284,22 @@ void AHeroCharacter::HandleWalkSpeedToggle()
 	}
 }
 
-void AHeroCharacter::ToggleCombat()
-{
-	if (UAbilitySystemComponent* ASC = GetAbilitySystemComponent())
-	{
-		ToggleCombatState(ASC);
-	}
-}
-
-void AHeroCharacter::ToggleCombatState(UAbilitySystemComponent* ASC)
-{
-	const bool bEnteringCombat = !bIsInCombat;
-	if (bEnteringCombat && !PrepareCombatLoadout())
-	{
-		return;
-	}
-
-	bIsInCombat = bEnteringCombat;
-	bIsInCombat ? EnterCombatState(ASC) : ExitCombatState(ASC);
-}
-
-void AHeroCharacter::EnterCombatState(UAbilitySystemComponent* ASC)
-{
-	HandleCombatTagChange(ASC, true);
-	ApplyCombatStateMovementOverrides();
-}
-
-void AHeroCharacter::ExitCombatState(UAbilitySystemComponent* ASC)
-{
-	HandleCombatTagChange(ASC, false);
-	RevertCombatStateMovementOverrides();
-}
-
-void AHeroCharacter::HandleCombatTagChange(UAbilitySystemComponent* ASC, bool bEnteringCombat)
-{
-	const FGameplayTag& TagToRemove = bEnteringCombat ? WoWCloneTags::State_Uncombat : WoWCloneTags::State_Combat;
-	const FGameplayTag& TagToAdd = bEnteringCombat ? WoWCloneTags::State_Combat : WoWCloneTags::State_Uncombat;
-
-	ToggleGameplayTagPair(ASC, TagToRemove, TagToAdd);
-}
-
-void AHeroCharacter::ApplyCombatStateMovementOverrides()
-{
-	if (HeroLocomotionComp)
-	{
-		HeroLocomotionComp->ApplyCombatStateOverrides();
-	}
-}
-
-void AHeroCharacter::RevertCombatStateMovementOverrides()
-{
-	if (HeroLocomotionComp)
-	{
-		HeroLocomotionComp->RevertCombatStateOverrides();
-	}
-}
-
-bool AHeroCharacter::PrepareCombatLoadout()
-{
-	if (!InventoryComp)
-	{
-		return true;
-	}
-
-	return InventoryComp->PrepareWeaponForCombat();
-}
-
 void AHeroCharacter::ToggleInventory()
 {
-	EnsureInventoryWidgetCreated();
-	ToggleInventoryVisibility();
+	if (AModularRPGPlayerController* PC = Cast<AModularRPGPlayerController>(GetPlayerController()))
+	{
+		PC->ToggleInventoryUI();
+	}
 
 	OnInventoryToggled.Broadcast();
 }
 
-void AHeroCharacter::EnsureInventoryWidgetCreated()
+void AHeroCharacter::ToggleSkillBook()
 {
-	if (InventoryWidgetInstance || !InventoryWidgetClass || !IsLocalPlayerControlled()) return;
-
-	if (APlayerController* PC = GetPlayerController())
+	if (AModularRPGPlayerController* PC = Cast<AModularRPGPlayerController>(GetPlayerController()))
 	{
-		InventoryWidgetInstance = CreateWidget<UInventoryWidget>(PC, InventoryWidgetClass);
-		if (InventoryWidgetInstance)
-		{
-			InventoryWidgetInstance->InitializeInventoryUI(InventoryComp);
-			InventoryWidgetInstance->AddToViewport();
-			InventoryWidgetInstance->SetVisibility(ESlateVisibility::Hidden);
-		}
+		PC->ToggleSkillBookUI();
 	}
-}
-
-void AHeroCharacter::ToggleInventoryVisibility()
-{
-	if (!InventoryWidgetInstance) return;
-
-	const bool bNextVisibility = (InventoryWidgetInstance->GetVisibility() != ESlateVisibility::Visible);
-	InventoryWidgetInstance->SetVisibility(bNextVisibility ? ESlateVisibility::Visible : ESlateVisibility::Hidden);
-
-	SetInputModeForInventory(bNextVisibility);
-}
-
-void AHeroCharacter::SetInputModeForInventory(bool bInventoryOpen)
-{
-	APlayerController* PC = GetPlayerController();
-	if (!PC || !IsLocalPlayerControlled()) return;
-
-	// Global mouse visibility rule for this project
-	PC->bShowMouseCursor = true;
-
-	FInputModeGameAndUI InputMode;
-	InputMode.SetHideCursorDuringCapture(false);
-	
-	if (bInventoryOpen)
-	{
-		InputMode.SetWidgetToFocus(InventoryWidgetInstance->TakeWidget());
-	}
-	
-	PC->SetInputMode(InputMode);
 }
 
 APlayerController* AHeroCharacter::GetPlayerController() const
@@ -426,14 +315,4 @@ bool AHeroCharacter::IsLocalPlayerControlled() const
 	}
 
 	return false;
-}
-
-void AHeroCharacter::TestVitals()
-{
-	if (UAbilitySystemComponent* ASC = GetAbilitySystemComponent())
-	{
-		// Directly deduct 20 HP and 20 Mana for testing UI smoothness
-		ASC->ApplyModToAttributeUnsafe(UCharacterAttributeSet::GetHealthAttribute(), EGameplayModOp::Additive, -20.0f);
-		ASC->ApplyModToAttributeUnsafe(UCharacterAttributeSet::GetManaAttribute(), EGameplayModOp::Additive, -20.0f);
-	}
 }

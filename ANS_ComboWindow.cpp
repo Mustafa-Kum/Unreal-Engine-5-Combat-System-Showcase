@@ -12,7 +12,7 @@ void UANS_ComboWindow::NotifyBegin(USkeletalMeshComponent* MeshComp, UAnimSequen
 	AActor* Owner = MeshComp->GetOwner();
 	if (UCombatComponent* CombatComp = Owner ? Owner->FindComponentByClass<UCombatComponent>() : nullptr)
 	{
-		CombatComp->SetCanAdvanceCombo(true);
+		CombatComp->BeginComboWindow(this, ComboWindowRequest);
 	}
 }
 
@@ -26,7 +26,7 @@ void UANS_ComboWindow::NotifyEnd(USkeletalMeshComponent* MeshComp, UAnimSequence
 	AActor* Owner = MeshComp->GetOwner();
 	if (UCombatComponent* CombatComp = Owner ? Owner->FindComponentByClass<UCombatComponent>() : nullptr)
 	{
-		CombatComp->SetCanAdvanceCombo(false);
+		CombatComp->EndComboWindow(this);
 	}
 }
 

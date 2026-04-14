@@ -1,5 +1,5 @@
 #include "Characters/HeroInputComponent.h"
-#include "Characters/CharacterBase.h"
+#include "Characters/HeroCharacter.h"
 #include "EnhancedInputComponent.h"
 #include "InputAction.h"
 
@@ -12,10 +12,10 @@ UHeroInputComponent::UHeroInputComponent()
 void UHeroInputComponent::BeginPlay()
 {
 	Super::BeginPlay();
-	OwnerCharacter = Cast<ACharacterBase>(GetOwner());
+	OwnerCharacter = Cast<AHeroCharacter>(GetOwner());
 }
 
-void UHeroInputComponent::InitializeInput(UEnhancedInputComponent* EnhancedInputComponent, ACharacterBase* InOwnerCharacter)
+void UHeroInputComponent::InitializeInput(UEnhancedInputComponent* EnhancedInputComponent, AHeroCharacter* InOwnerCharacter)
 {
 	if (!ShouldBindInput(EnhancedInputComponent, InOwnerCharacter)) return;
 	
@@ -41,12 +41,16 @@ void UHeroInputComponent::BindInputActions(UEnhancedInputComponent* EnhancedInpu
 	BindActionIfValid(RightClickAction,   ETriggerEvent::Completed, &UHeroInputComponent::OnRightClickCompleted);
 	BindActionIfValid(LeftClickAction,    ETriggerEvent::Started,   &UHeroInputComponent::OnLeftClickStarted);
 	BindActionIfValid(LeftClickAction,    ETriggerEvent::Completed, &UHeroInputComponent::OnLeftClickCompleted);
-	BindActionIfValid(ZoomAction,         ETriggerEvent::Triggered, &UHeroInputComponent::OnZoomAction);
 	BindActionIfValid(ToggleWeaponAction, ETriggerEvent::Started,   &UHeroInputComponent::OnToggleWeapon);
+	BindActionIfValid(PrimaryAbilityAction, ETriggerEvent::Started, &UHeroInputComponent::OnPrimaryAbilityAction);
+	BindActionIfValid(ActionBarSlot2Action, ETriggerEvent::Started, &UHeroInputComponent::OnActionBarSlot2Action);
+	BindActionIfValid(ActionBarSlot3Action, ETriggerEvent::Started, &UHeroInputComponent::OnActionBarSlot3Action);
+	BindActionIfValid(ActionBarSlot4Action, ETriggerEvent::Started, &UHeroInputComponent::OnActionBarSlot4Action);
+	BindActionIfValid(ActionBarSlot5Action, ETriggerEvent::Started, &UHeroInputComponent::OnActionBarSlot5Action);
+	BindActionIfValid(ZoomAction,         ETriggerEvent::Triggered, &UHeroInputComponent::OnZoomAction);
 	BindActionIfValid(ToggleWalkAction,   ETriggerEvent::Started,   &UHeroInputComponent::OnToggleWalk);
-	BindActionIfValid(ToggleCombatAction, ETriggerEvent::Started,   &UHeroInputComponent::OnToggleCombat);
 	BindActionIfValid(ToggleInventoryAction, ETriggerEvent::Started, &UHeroInputComponent::OnToggleInventory);
-	BindActionIfValid(TestVitalsAction, ETriggerEvent::Started,     &UHeroInputComponent::OnTestVitals);
+	BindActionIfValid(ToggleSkillBookAction, ETriggerEvent::Started, &UHeroInputComponent::OnToggleSkillBook);
 }
 
 // ==============================================================================
@@ -59,7 +63,7 @@ bool UHeroInputComponent::IsOwnerValid() const
 	return OwnerCharacter != nullptr;
 }
 
-bool UHeroInputComponent::ShouldBindInput(UEnhancedInputComponent* EnhancedInputComponent, ACharacterBase* InOwnerCharacter) const
+bool UHeroInputComponent::ShouldBindInput(UEnhancedInputComponent* EnhancedInputComponent, AHeroCharacter* InOwnerCharacter) const
 {
 	if (!EnhancedInputComponent || !InOwnerCharacter)
 	{
@@ -85,22 +89,47 @@ void UHeroInputComponent::OnLookAction(const FInputActionValue& Value)
 
 void UHeroInputComponent::OnRightClickStarted()
 {
-	if (IsOwnerValid()) OwnerCharacter->RightClickStarted();
+	if (IsOwnerValid()) OwnerCharacter->HeavyAttackStarted();
 }
 
 void UHeroInputComponent::OnRightClickCompleted()
 {
-	if (IsOwnerValid()) OwnerCharacter->RightClickCompleted();
+	if (IsOwnerValid()) OwnerCharacter->HeavyAttackCompleted();
 }
 
 void UHeroInputComponent::OnLeftClickStarted()
 {
-	if (IsOwnerValid()) OwnerCharacter->LeftClickStarted();
+	if (IsOwnerValid()) OwnerCharacter->LightAttackStarted();
 }
 
 void UHeroInputComponent::OnLeftClickCompleted()
 {
-	if (IsOwnerValid()) OwnerCharacter->LeftClickCompleted();
+	if (IsOwnerValid()) OwnerCharacter->LightAttackCompleted();
+}
+
+void UHeroInputComponent::OnPrimaryAbilityAction()
+{
+	if (IsOwnerValid()) OwnerCharacter->ActivateActionBarSlot(0);
+}
+
+void UHeroInputComponent::OnActionBarSlot2Action()
+{
+	if (IsOwnerValid()) OwnerCharacter->ActivateActionBarSlot(1);
+}
+
+void UHeroInputComponent::OnActionBarSlot3Action()
+{
+	if (IsOwnerValid()) OwnerCharacter->ActivateActionBarSlot(2);
+}
+
+void UHeroInputComponent::OnActionBarSlot4Action()
+{
+	if (IsOwnerValid()) OwnerCharacter->ActivateActionBarSlot(3);
+}
+
+void UHeroInputComponent::OnActionBarSlot5Action()
+{
+	if (IsOwnerValid()) OwnerCharacter->ActivateActionBarSlot(4);
 }
 
 void UHeroInputComponent::OnZoomAction(const FInputActionValue& Value)
@@ -118,17 +147,12 @@ void UHeroInputComponent::OnToggleWalk()
 	if (IsOwnerValid()) OwnerCharacter->ToggleWalk();
 }
 
-void UHeroInputComponent::OnToggleCombat()
-{
-	if (IsOwnerValid()) OwnerCharacter->ToggleCombat();
-}
-
 void UHeroInputComponent::OnToggleInventory()
 {
 	if (IsOwnerValid()) OwnerCharacter->ToggleInventory();
 }
 
-void UHeroInputComponent::OnTestVitals()
+void UHeroInputComponent::OnToggleSkillBook()
 {
-	if (IsOwnerValid()) OwnerCharacter->TestVitals();
+	if (IsOwnerValid()) OwnerCharacter->ToggleSkillBook();
 }

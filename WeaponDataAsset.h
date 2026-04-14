@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "CombatTypes.h"
 #include "DataAssets/ItemDataAsset.h"
 #include "WeaponDataAsset.generated.h"
 
@@ -24,6 +25,9 @@ struct FCombatComboData
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat")
 	TArray<TSoftObjectPtr<class UAnimMontage>> ComboMontages;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat")
+	TArray<FMeleeKnockbackConfig> ComboStepKnockbackConfigs;
 
 	/** Window after the last attack where the combo resets if no input is received */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat", meta = (ClampMin = "0.0"))
@@ -56,14 +60,17 @@ struct FWeaponData
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Visual")
 	TSoftObjectPtr<class UStaticMesh> WeaponMesh;
 
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats", meta = (ClampMin = "0.0"))
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats", meta = (ClampMin = "0.0", DisplayName = "Fallback Attack Damage"))
 	float BaseDamage = 10.0f;
 
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats", meta = (ClampMin = "0.1"))
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats", meta = (ClampMin = "0.0", DisplayName = "Fallback Cast Speed"))
 	float WeaponCastSpeed = 2.0f;
 
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat")
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat", meta = (DisplayName = "Light Attack Combo Data"))
 	FCombatComboData ComboData;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat", meta = (DisplayName = "Heavy Attack Combo Data"))
+	FCombatComboData HeavyAttackComboData;
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat|Hit Stop")
 	bool bEnableHitStop = true;

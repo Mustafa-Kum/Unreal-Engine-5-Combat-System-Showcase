@@ -21,29 +21,50 @@ class WOWCLONE_API UCharacterAttributeSet : public UAttributeSet
 	
 public:
 	UCharacterAttributeSet();
+	void InitializeStartingStats(const struct FCharacterStartingStats& Stats);
+	[[nodiscard]] static FString GetFriendlyAttributeLabel(const FGameplayAttribute& Attribute);
+	[[nodiscard]] static bool IsPercentageDisplayAttribute(const FGameplayAttribute& Attribute);
 
 	// UAttributeSet Overrides
 	virtual void PreAttributeChange(const FGameplayAttribute& Attribute, float& NewValue) override;
+	virtual void PreAttributeBaseChange(const FGameplayAttribute& Attribute, float& NewValue) const override;
+	virtual void PostAttributeChange(const FGameplayAttribute& Attribute, float OldValue, float NewValue) override;
+	virtual void PostAttributeBaseChange(const FGameplayAttribute& Attribute, float OldValue, float NewValue) const override;
 	virtual void PostGameplayEffectExecute(const struct FGameplayEffectModCallbackData& Data) override;
 
 private:
 	// SOLID Helpers: Each scaling rule extracted from PreAttributeChange (Orchestrator Pattern)
-	bool HandleDerivedAttributeChange(const FGameplayAttribute& Attribute, float& NewValue);
-	bool HandleClampedVitalChange(const FGameplayAttribute& Attribute, float& NewValue) const;
+	void SetAttributeBaseValue(const FGameplayAttribute& Attribute, float NewValue) const;
+	[[nodiscard]] float GetAttributeBaseValue(const FGameplayAttribute& Attribute) const;
+	void ApplyAdditiveAttributeBaseDelta(const FGameplayAttribute& Attribute, float Delta) const;
+	bool HandleClampedAttributeChange(const FGameplayAttribute& Attribute, float& NewValue) const;
 	void ClampPostEffectAttribute(const FGameplayAttribute& Attribute);
-	void RecalculateFromStrength(float NewStrength);
-	void RecalculateFromAgility(float NewAgility);
-	void RecalculateFromWeaponInterval(float NewInterval);
-	void RecalculateFromIntellect(float NewIntellect);
-	void RecalculateFromStamina(float NewStamina);
+	void HandleDerivedAttributeChange(const FGameplayAttribute& Attribute, float OldValue, float NewValue);
+	void RecalculateFromStrength(float OldStrength, float NewStrength);
+	void RecalculateFromAgility(float OldAgility, float NewAgility);
+	void RecalculateFromIntellect(float OldIntellect, float NewIntellect);
+	void RecalculateFromStamina(float OldStamina, float NewStamina);
 	void ClampHealth(float& NewValue) const;
 	void ClampMana(float& NewValue) const;
+	void ClampArmor(float& NewValue) const;
+	void ClampMagicResistance(float& NewValue) const;
+	void ClampCastSpeed(float& NewValue) const;
 
 	// DRY: Proportional current value adjustment when Max changes (Stamina/Intellect scaling)
 	void AdjustAttributeProportionally(const FGameplayAttribute& CurrentAttr, float NewMax, float OldMax);
-
-	// DRY: Pure formula for Agility -> Haste conversion
-	[[nodiscard]] float CalculateHastedInterval(float BaseInterval, float AgilityValue) const;
+	bool bIsInitializingStartingStats = false;
+	float BaseHealthFromScaling = 100.0f;
+	float AttackDamagePerStrength = 2.0f;
+	float ArmorPerAgility = 1.0f;
+	float CastSpeedPercentPerAgility = 1.0f;
+	float MaxCastSpeedPercent = 90.0f;
+	float SpellDamagePerIntellect = 2.5f;
+	float MaxManaPerIntellect = 15.0f;
+	float MaxHealthPerStamina = 10.0f;
+	float BaseHealthRegen = 1.0f;
+	float HealthRegenPerStrength = 0.15f;
+	float BaseManaRegen = 2.0f;
+	float ManaRegenPerIntellect = 0.25f;
 
 public:
 
@@ -56,7 +77,7 @@ public:
 	FGameplayAttributeData Strength;
 	ATTRIBUTE_ACCESSORS(UCharacterAttributeSet, Strength)
 
-	// Increases Attack Speed
+	// Increases Armor and Cast Speed
 	UPROPERTY(BlueprintReadOnly, Category = "Attributes|Primary")
 	FGameplayAttributeData Agility;
 	ATTRIBUTE_ACCESSORS(UCharacterAttributeSet, Agility)
@@ -103,6 +124,16 @@ public:
 	FGameplayAttributeData Mana;
 	ATTRIBUTE_ACCESSORS(UCharacterAttributeSet, Mana)
 
+	// Health regeneration applied per second by the owning character's resource loop.
+	UPROPERTY(BlueprintReadOnly, Category = "Attributes|Vital")
+	FGameplayAttributeData HealthRegen;
+	ATTRIBUTE_ACCESSORS(UCharacterAttributeSet, HealthRegen)
+
+	// Mana regeneration applied per second by the owning character's resource loop.
+	UPROPERTY(BlueprintReadOnly, Category = "Attributes|Vital")
+	FGameplayAttributeData ManaRegen;
+	ATTRIBUTE_ACCESSORS(UCharacterAttributeSet, ManaRegen)
+
 	// Maximum Mana (Derived from Intellect)
 	UPROPERTY(BlueprintReadOnly, Category = "Attributes|Vital")
 	FGameplayAttributeData MaxMana;
@@ -113,15 +144,15 @@ public:
 	FGameplayAttributeData AttackDamage;
 	ATTRIBUTE_ACCESSORS(UCharacterAttributeSet, AttackDamage)
 
-	// Final Cast interval in seconds (Derived: WeaponBaseInterval / (1 + Haste))
+	// Percent cooldown reduction applied to ability cooldowns
 	UPROPERTY(BlueprintReadOnly, Category = "Attributes|Derived")
 	FGameplayAttributeData CastSpeed;
 	ATTRIBUTE_ACCESSORS(UCharacterAttributeSet, CastSpeed)
 
-	// The base interval of the current weapon (e.g., 3.64)
+	// Magical resistance / mitigation source for spell damage.
 	UPROPERTY(BlueprintReadOnly, Category = "Attributes|Derived")
-	FGameplayAttributeData WeaponBaseInterval;
-	ATTRIBUTE_ACCESSORS(UCharacterAttributeSet, WeaponBaseInterval)
+	FGameplayAttributeData MagicResistance;
+	ATTRIBUTE_ACCESSORS(UCharacterAttributeSet, MagicResistance)
 
 	// Magical Damage (Derived from Intellect)
 	UPROPERTY(BlueprintReadOnly, Category = "Attributes|Derived")

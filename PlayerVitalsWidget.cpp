@@ -3,6 +3,12 @@
 #include "Abilities/AttributeSets/CharacterAttributeSet.h"
 #include "Components/ProgressBar.h"
 #include "Components/TextBlock.h"
+#include "Engine/World.h"
+
+namespace
+{
+	constexpr float VitalsWidgetUpdateInterval = 1.0f / 60.0f;
+}
 
 void UPlayerVitalsWidget::InitializeVitals(UAbilitySystemComponent* InASC)
 {
@@ -15,6 +21,7 @@ void UPlayerVitalsWidget::InitializeVitals(UAbilitySystemComponent* InASC)
 	// Initial display refresh with current attribute values
 	UpdateHealthDisplay();
 	UpdateManaDisplay();
+	RefreshScheduledUpdateState();
 }
 
 void UPlayerVitalsWidget::NativeConstruct()
@@ -24,6 +31,8 @@ void UPlayerVitalsWidget::NativeConstruct()
 	// Start trailing timers effectively infinite so they don't move initially
 	TrailingHealthTimer = 999.0f;
 	TrailingManaTimer = 999.0f;
+	PendingTrailingHealthRaiseTarget = 1.0f;
+	PendingTrailingManaRaiseTarget = 1.0f;
 
 	// If already initialized (InitializeVitals called before AddToViewport), force a visual refresh
 	if (CachedASC)
@@ -31,25 +40,16 @@ void UPlayerVitalsWidget::NativeConstruct()
 		UpdateHealthDisplay();
 		UpdateManaDisplay();
 	}
+
+	RefreshScheduledUpdateState();
 }
 
 void UPlayerVitalsWidget::NativeDestruct()
 {
+	StopScheduledUpdates();
 	UnbindFromAbilitySystem();
 
 	Super::NativeDestruct();
-}
-
-void UPlayerVitalsWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
-{
-	Super::NativeTick(MyGeometry, InDeltaTime);
-
-	if (!HasActiveInterpolation())
-	{
-		return;
-	}
-
-	ProcessAllInterpolations(InDeltaTime);
 }
 
 void UPlayerVitalsWidget::ProcessAllInterpolations(float DeltaTime)
@@ -61,6 +61,20 @@ void UPlayerVitalsWidget::ProcessAllInterpolations(float DeltaTime)
 	// Orchestrate Trailing Bars
 	ProcessTrailingBarInterpolation(TrailingHealthBar, TargetHealthPercent, TrailingHealthTimer, DeltaTime);
 	ProcessTrailingBarInterpolation(TrailingManaBar, TargetManaPercent, TrailingManaTimer, DeltaTime);
+
+	if (TrailingHealthBar
+		&& TrailingHealthTimer >= 999.0f
+		&& PendingTrailingHealthRaiseTarget > TrailingHealthBar->GetPercent())
+	{
+		TrailingHealthBar->SetPercent(PendingTrailingHealthRaiseTarget);
+	}
+
+	if (TrailingManaBar
+		&& TrailingManaTimer >= 999.0f
+		&& PendingTrailingManaRaiseTarget > TrailingManaBar->GetPercent())
+	{
+		TrailingManaBar->SetPercent(PendingTrailingManaRaiseTarget);
+	}
 }
 
 void UPlayerVitalsWidget::ProcessMainBarInterpolation(UProgressBar* MainBar, float TargetPercent, float DeltaTime)
@@ -79,6 +93,12 @@ void UPlayerVitalsWidget::ProcessTrailingBarInterpolation(UProgressBar* Trailing
 	if (Timer <= 0.0f)
 	{
 		ExecuteBarInterpolation(TrailingBar, TargetPercent, TrailingBarInterpSpeed, DeltaTime);
+	}
+
+	const bool bReachedTarget = FMath::IsNearlyEqual(TrailingBar->GetPercent(), TargetPercent, 0.0025f);
+	if (bReachedTarget && Timer < 999.0f)
+	{
+		Timer = 999.0f;
 	}
 }
 
@@ -119,10 +139,10 @@ void UPlayerVitalsWidget::BindToAbilitySystem(UAbilitySystemComponent* InASC)
 		return;
 	}
 
-	InASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetHealthAttribute()).AddUObject(this, &UPlayerVitalsWidget::OnHealthChanged);
-	InASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetMaxHealthAttribute()).AddUObject(this, &UPlayerVitalsWidget::OnMaxHealthChanged);
-	InASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetManaAttribute()).AddUObject(this, &UPlayerVitalsWidget::OnManaChanged);
-	InASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetMaxManaAttribute()).AddUObject(this, &UPlayerVitalsWidget::OnMaxManaChanged);
+	HealthChangedHandle = InASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetHealthAttribute()).AddUObject(this, &UPlayerVitalsWidget::OnHealthChanged);
+	MaxHealthChangedHandle = InASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetMaxHealthAttribute()).AddUObject(this, &UPlayerVitalsWidget::OnMaxHealthChanged);
+	ManaChangedHandle = InASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetManaAttribute()).AddUObject(this, &UPlayerVitalsWidget::OnManaChanged);
+	MaxManaChangedHandle = InASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetMaxManaAttribute()).AddUObject(this, &UPlayerVitalsWidget::OnMaxManaChanged);
 }
 
 void UPlayerVitalsWidget::UnbindFromAbilitySystem()
@@ -132,10 +152,30 @@ void UPlayerVitalsWidget::UnbindFromAbilitySystem()
 		return;
 	}
 
-	CachedASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetHealthAttribute()).RemoveAll(this);
-	CachedASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetMaxHealthAttribute()).RemoveAll(this);
-	CachedASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetManaAttribute()).RemoveAll(this);
-	CachedASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetMaxManaAttribute()).RemoveAll(this);
+	if (HealthChangedHandle.IsValid())
+	{
+		CachedASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetHealthAttribute()).Remove(HealthChangedHandle);
+		HealthChangedHandle.Reset();
+	}
+
+	if (MaxHealthChangedHandle.IsValid())
+	{
+		CachedASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetMaxHealthAttribute()).Remove(MaxHealthChangedHandle);
+		MaxHealthChangedHandle.Reset();
+	}
+
+	if (ManaChangedHandle.IsValid())
+	{
+		CachedASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetManaAttribute()).Remove(ManaChangedHandle);
+		ManaChangedHandle.Reset();
+	}
+
+	if (MaxManaChangedHandle.IsValid())
+	{
+		CachedASC->GetGameplayAttributeValueChangeDelegate(UCharacterAttributeSet::GetMaxManaAttribute()).Remove(MaxManaChangedHandle);
+		MaxManaChangedHandle.Reset();
+	}
+
 	CachedASC = nullptr;
 }
 
@@ -150,6 +190,7 @@ void UPlayerVitalsWidget::UpdateHealthDisplay()
 		UCharacterAttributeSet::GetMaxHealthAttribute(),
 		TargetHealthPercent,
 		TrailingHealthTimer,
+		PendingTrailingHealthRaiseTarget,
 		TrailingHealthBar,
 		HealthText
 	);
@@ -162,12 +203,13 @@ void UPlayerVitalsWidget::UpdateManaDisplay()
 		UCharacterAttributeSet::GetMaxManaAttribute(),
 		TargetManaPercent,
 		TrailingManaTimer,
+		PendingTrailingManaRaiseTarget,
 		TrailingManaBar,
 		ManaText
 	);
 }
 
-void UPlayerVitalsWidget::RefreshVitalDisplay(const FGameplayAttribute& CurrentAttr, const FGameplayAttribute& MaxAttr, float& InOutTargetPercent, float& InOutTrailingTimer, UProgressBar* TrailingBar, UTextBlock* ValueText)
+void UPlayerVitalsWidget::RefreshVitalDisplay(const FGameplayAttribute& CurrentAttr, const FGameplayAttribute& MaxAttr, float& InOutTargetPercent, float& InOutTrailingTimer, float& InOutPendingTrailingRaiseTarget, UProgressBar* TrailingBar, UTextBlock* ValueText)
 {
 	// 1. Validation
 	if (!CachedASC) return;
@@ -178,8 +220,9 @@ void UPlayerVitalsWidget::RefreshVitalDisplay(const FGameplayAttribute& CurrentA
 	const float NewTargetPercent = CalculateTargetPercent(CurrentValue, MaxValue);
 
 	// 3. Execution
-	UpdateTrailingState(NewTargetPercent, InOutTargetPercent, InOutTrailingTimer, TrailingBar);
+	UpdateTrailingState(NewTargetPercent, InOutTargetPercent, InOutTrailingTimer, InOutPendingTrailingRaiseTarget, TrailingBar);
 	ExecuteVitalTextUpdate(ValueText, CurrentValue, MaxValue);
+	RefreshScheduledUpdateState();
 }
 
 // ==============================================================================
@@ -196,18 +239,36 @@ float UPlayerVitalsWidget::CalculateTargetPercent(float CurrentValue, float MaxV
 	return (MaxValue > 0.0f) ? (CurrentValue / MaxValue) : 0.0f;
 }
 
-void UPlayerVitalsWidget::UpdateTrailingState(float NewTargetPercent, float& InOutTargetPercent, float& InOutTrailingTimer, UProgressBar* TrailingBar)
+void UPlayerVitalsWidget::UpdateTrailingState(float NewTargetPercent, float& InOutTargetPercent, float& InOutTrailingTimer, float& InOutPendingTrailingRaiseTarget, UProgressBar* TrailingBar)
 {
-    // If healing or startup: snap trailing bar instantly
-	if (NewTargetPercent >= InOutTargetPercent)
+	const float CurrentTrailingPercent = TrailingBar ? TrailingBar->GetPercent() : InOutTargetPercent;
+
+	// A drop starts a delayed trailing animation immediately and clears any older queued raise.
+	if (NewTargetPercent < InOutTargetPercent)
 	{
-		if (TrailingBar) TrailingBar->SetPercent(NewTargetPercent);
-		InOutTrailingTimer = 999.0f; // Disable trailing animation
+		InOutPendingTrailingRaiseTarget = NewTargetPercent;
+		InOutTrailingTimer = TrailingDelay;
 	}
 	else
 	{
-		// Took damage: start delay countdown
-		InOutTrailingTimer = TrailingDelay;
+		const bool bTrailingDropInProgress = TrailingBar
+			&& CurrentTrailingPercent > InOutTargetPercent
+			&& InOutTrailingTimer < 999.0f;
+
+		if (bTrailingDropInProgress)
+		{
+			InOutPendingTrailingRaiseTarget = FMath::Max(InOutPendingTrailingRaiseTarget, NewTargetPercent);
+		}
+		else
+		{
+			if (TrailingBar)
+			{
+				TrailingBar->SetPercent(NewTargetPercent);
+			}
+
+			InOutPendingTrailingRaiseTarget = NewTargetPercent;
+			InOutTrailingTimer = 999.0f;
+		}
 	}
 
 	InOutTargetPercent = NewTargetPercent;
@@ -234,4 +295,55 @@ bool UPlayerVitalsWidget::HasActiveInterpolation() const
 	const bool bManaMainActive = ManaBar && !FMath::IsNearlyEqual(ManaBar->GetPercent(), TargetManaPercent, KINDA_SMALL_NUMBER);
 
 	return bHealthTrailingActive || bManaTrailingActive || bHealthMainActive || bManaMainActive;
+}
+
+void UPlayerVitalsWidget::RefreshScheduledUpdateState()
+{
+	if (HasActiveInterpolation() || HasAdditionalScheduledWork())
+	{
+		StartScheduledUpdates();
+		return;
+	}
+
+	StopScheduledUpdates();
+}
+
+bool UPlayerVitalsWidget::HasAdditionalScheduledWork() const
+{
+	return false;
+}
+
+void UPlayerVitalsWidget::ProcessAdditionalScheduledWork(float DeltaTime)
+{
+}
+
+void UPlayerVitalsWidget::HandleScheduledUpdate()
+{
+	ProcessAllInterpolations(VitalsWidgetUpdateInterval);
+	ProcessAdditionalScheduledWork(VitalsWidgetUpdateInterval);
+	RefreshScheduledUpdateState();
+}
+
+void UPlayerVitalsWidget::StartScheduledUpdates()
+{
+	UWorld* World = GetWorld();
+	if (!World || World->GetTimerManager().IsTimerActive(ScheduledUpdateTimerHandle))
+	{
+		return;
+	}
+
+	World->GetTimerManager().SetTimer(
+		ScheduledUpdateTimerHandle,
+		this,
+		&UPlayerVitalsWidget::HandleScheduledUpdate,
+		VitalsWidgetUpdateInterval,
+		true);
+}
+
+void UPlayerVitalsWidget::StopScheduledUpdates()
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(ScheduledUpdateTimerHandle);
+	}
 }
